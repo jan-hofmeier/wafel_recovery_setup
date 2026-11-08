@@ -40,7 +40,7 @@ returning 0; the ramdisk format is never blocked):
 | `make INSTALLONLY=1` | **blocked** | blocked |
 | add `SLCFORMAT=1` | conditional, for rebuilding a blank SLC | as above |
 
-**Both builds repair the SLC before the install** (`recupd_prepare_slc`, see
+**Both builds repair the SLC before the install** (`slc_prepare`, see
 `docs/slc_minimum_for_recovery.md` in the IOSU notes):
 - `system.xml` missing → MCP's own `MCP_WriteDefaultSystemConfig(1)`
   (`0x050049c0`, Thumb), which stock MCP only calls after a full SLC wipe.
@@ -63,7 +63,7 @@ installed; the next boot loads the IOS from the new SLC and starts the initial
 setup. Details in the IOSU notes, `docs/slc_minimum_for_recovery.md`.
 
 Test switch `DELTEST=1`: deletes `sys_prod.xml`, `cert.sys`, `title.list`
-and `system.xml` (with flush and check) at the start of the worker.
+and `system.xml` (with flush and check) at the start of the install thread.
 
 Both share everything else (recovery entry, 1080p screen, success check,
 self-delete, messages). Run `make clean` between builds; `make clean` removes
@@ -78,7 +78,7 @@ successful, no region step, plugin removed.
    routine installs from a plain folder instead of an ATFS "UP" volume.
 2. The recovery thread mounts the SLC/MLC/SLCCMPT (formatting only what is
    unformatted), initialises ES/install, and draws the recovery screen on the TV.
-3. A worker thread then mounts the FAT SD at `/vol/sdcard` and, if
+3. An install thread then mounts the FAT SD at `/vol/sdcard` and, if
    `/vol/sdcard/wafel_install` exists, calls `MCP_DR_SystemUpdateFromMedia` on it.
    Before that it deletes `/vol/system_slc/proc/prefs/cafe.xml`, so the next
    boot runs the initial setup (see "Initial setup").
@@ -106,14 +106,13 @@ needed: on a non-ATFS volume the engine enumerates the subdirectories directly.
 
 ## Compile-time options
 
-Pass via `EXTRA_CFLAGS`, e.g.
-`make EXTRA_CFLAGS="-DRECUPD_FORCE_FORMAT"`.
+Set in `source/config.h`.
 
 | Define | Default | Effect |
 |---|---|---|
-| `RECUPD_FORCE_FORMAT` | off | Keep the factory forced format of SLCCMPT and the MLC. Off = format only when the volume is unformatted / the wrong file system (like `wafel_setup_mlc`). |
-| `RECUPD_REQUIRE_FULL_SYSTEM` | off | Keep the factory check that the package is a complete system (OS + boot titles). Off (default) installs any set of WUPs. |
-| `RECUPD_KEEP_NORMAL_LEVEL` | off | Leave the security level alone. By default (`RECUPD_FORCE_TEST_LEVEL`) MCP's `IOS_GetSecurityLevel` is patched to return Test; without it a reinstall of titles already installed at the same or a newer version is skipped (see below). |
+| `DRSETUP_FORCE_FORMAT` | off | Keep the factory forced format of SLCCMPT and the MLC. Off = format only when the volume is unformatted / the wrong file system (like `wafel_setup_mlc`). |
+| `DRSETUP_REQUIRE_FULL_SYSTEM` | off | Keep the factory check that the package is a complete system (OS + boot titles). Off (default) installs any set of WUPs. |
+| `DRSETUP_KEEP_NORMAL_LEVEL` | off | Leave the security level alone. By default (`DRSETUP_FORCE_TEST_LEVEL`) MCP's `IOS_GetSecurityLevel` is patched to return Test; without it a reinstall of titles already installed at the same or a newer version is skipped (see below). |
 
 Tickets are **never** deleted, in any build.
 
@@ -134,7 +133,7 @@ MCP only (not the kernel, ES, crypto or FS).
 
 | LED | Meaning |
 |---|---|
-| Blue blinking | worker running / install in progress |
+| Blue blinking | install thread running / install in progress |
 | Solid blue | success (plugin deleted itself) |
 | Orange | no `wafel_install` folder on SD — nothing done, recovery menu stays up |
 | Red / red blinking | FSA/open failure or the update failed (see `/vol/sdcard/wafel_drsetup.log` and the on-screen line) |
@@ -156,10 +155,25 @@ Test variants (run `make clean` before switching builds):
 - `make REGIONTEST=1`: sets sys_prod's region to 2 (USA) before the install, so
   the region fix afterwards has to write it back. Otherwise a normal run.
 
+## Source layout
+
+| File | Contents |
+|---|---|
+| `source/main.c` | `kern_main`: recovery entry, panic, PPC, security level, boot-title check, ticket skip, format rules |
+| `source/display.c` | recovery screen: TV surface, `MCP_InitMenu` redirect, 1080p, screen-log bottom box, `MCP_ShowMenu` hook that starts the install thread |
+| `source/install.c` | install thread: SD, SLC preparation, the update, success check, self-delete |
+| `source/slc.c` | `cafe.xml` delete, `system.xml`/`cert.sys` repair, region fix + sys_prod hook, DELTEST |
+| `source/log.c` | FSA handle (`MCP_fsaInit(NULL)`), SD log, messages on the screen |
+| `source/mcp.h` | MCP addresses and function pointers |
+| `source/patch16.h` | halfword patch helper (2-byte Thumb patches; see `docs/stroopwafel_plugin_api.md`) |
+
 ## How it works (patch map)
 
-All addresses are IOSU 5.5.x retail (`fw.elf` 00050010-1000400A). Each patch is
-guarded by an `expect` check of the original bytes.
+All addresses are IOSU 5.5.x retail (`fw.elf` 00050010-1000400A). Patches are
+applied unconditionally: stroopwafel only runs on 5.5.x, where these modules
+don't change between releases. (Earlier versions compared each site with its
+original bytes and skipped the patch on a mismatch; removed 2026-11-09, since
+a silently skipped patch is worse than a crash.)
 
 | VA | Patch | Purpose |
 |---|---|---|
@@ -167,16 +181,16 @@ guarded by an `expect` check of the original bytes.
 | 0x0501fc98 | `b 0x0501fdec` | `MCP_Startup`: force the Boot Recovery branch (security level Test, PM mode 0x40000) |
 | 0x0510ea1c | `movs r0,#0; nop` | `MCP_StartDRThread`: start the recovery thread on retail |
 | 0x050340ee | `movs r0,#0; nop` | never start the PPC |
-| 0x0510ec38 / 0x0510ed96 / 0x0510ecd4 | `movs r2,#0` | `MCP_DR_SystemUpdateFromMedia`: SLCCMPT / MLC / SLC formats become conditional (omitted with `RECUPD_FORCE_FORMAT`) |
+| 0x0510ec38 / 0x0510ed96 / 0x0510ecd4 | `movs r2,#0` | `MCP_DR_SystemUpdateFromMedia`: SLCCMPT / MLC / SLC formats become conditional (omitted with `DRSETUP_FORCE_FORMAT`) |
 | 0x0510ef48 | `b 0x0510f0c0` | skip ticket deletion, go to the progress thread + `MCP_SystemUpdate` |
-| 0x0510eaee | `movs r0,#0; nop` | skip the full-system-package check (omitted with `RECUPD_REQUIRE_FULL_SYSTEM`) |
-| 0x05059090 | `movs r0,#0xa; bx lr` | MCP `IOS_GetSecurityLevel` returns Test, so the update engine doesn't skip same-version titles (omitted with `RECUPD_KEEP_NORMAL_LEVEL`) |
-| bl @0x0510f88a | `trampoline_t_blreplace` | `bl MCP_ShowMenu` in the recovery thread: run it, log the menu surface, then start the worker |
+| 0x0510eaee | `movs r0,#0; nop` | skip the full-system-package check (omitted with `DRSETUP_REQUIRE_FULL_SYSTEM`) |
+| 0x05059090 | `movs r0,#0xa; bx lr` | MCP `IOS_GetSecurityLevel` returns Test, so the update engine doesn't skip same-version titles (omitted with `DRSETUP_KEEP_NORMAL_LEVEL`) |
+| bl @0x0510f88a | `trampoline_t_blreplace` | `bl MCP_ShowMenu` in the recovery thread: run it, log the menu surface, then start the install thread |
 | 0x051003c4 | `movs r3,#0` (was `#1`) | `MCP_ShowMenu`: BSP `DC_INIT` id 0 (1080p) instead of id 1 (480p), see "Display" |
 | bl @0x0510f04c | `trampoline_t_blreplace` | `bl MCP_LoadSysProdXML` after a successful `MCP_SystemUpdate` (step 0x13): fix the region in `sys_prod.xml`, then run the original load (see "Region") |
-| bl @0x051003fe | `trampoline_t_blreplace` (found by scanning `MCP_ShowMenu`) | `bl MCP_InitMenu`: replace DC_CONFIG's framebuffer with the surface the TV scans out (read in `kern_main`), see "Display" |
+| bl @0x051003fe | `trampoline_t_blreplace` | `bl MCP_InitMenu`: replace DC_CONFIG's framebuffer with the surface the TV scans out (read in `kern_main`), see "Display" |
 
-The worker calls `MCP_DR_SystemUpdateFromMedia("/vol/sdcard/wafel_install", 0)`
+The install thread calls `MCP_DR_SystemUpdateFromMedia("/vol/sdcard/wafel_install", 0)`
 and reads the recovery progress global at `0x1fe01584` (`== 0x13` means a full
 success).
 
@@ -334,7 +348,7 @@ Hardware, 2026-11-08:
   isn't running (open/read/write return `-6`).
 - First fix: edit `initial_launch` in `cafe.xml` in place (2 → 0); the next boot
   started the initial setup.
-- **Current behaviour:** the worker **deletes** `cafe.xml` (then flushes the
+- **Current behaviour:** the install thread **deletes** `cafe.xml` (then flushes the
   SLC) before the reinstall; MCP powers off right after a successful one, so it
   can't come after. See below for why; "not found" counts as fine. Release run
   2026-11-08: the file (recreated by the previous setup boot) was deleted,
@@ -383,7 +397,7 @@ the user suggested: the end of the recovery update.
 - The hook replaces `bl MCP_LoadSysProdXML` at `0x0510f04c` (original
   `f6f2fdbc`). It only runs after a successful install, before the success line
   and before power transitions are re-enabled, so it doesn't race the power-off.
-  It runs in the worker thread (the worker calls the DR function).
+  It runs in the install thread (that thread calls the DR function).
 - It reads the coldboot title with `MCP_SysCfg_GetDefaultTitle`
   (`0x05004714`, Thumb). If it is `00050010100400x0`, the region is `1 << x`
   (1 JPN, 2 USA, 4 EUR, ...). If `product_area` or `game_region` differ, it
@@ -418,7 +432,7 @@ until the update succeeds or the `.ipx` is removed.
 | MLC missing / doesn't attach (tested: MLC disconnected) | recovery's 15 s wait fails, resume skips mounts and ES; "FAILED to open cafe.xml"; MCP fails at step 8 "failed to stop ES"; "system update FAILED at step 0x08", "plugin stays on the SD: the next boot retries", red LED | no (step 8 is before any format) |
 | Install fails (`MCP_SystemUpdate` error) | MCP "System update failed, err N", plugin "FAILED at step 0x12", red LED; console stays on the screen (no power-off) | yes: conditional MLC format, `security/version` deleted, `cafe.xml` deleted, titles installed so far (rollback not checked) |
 | Region fix fails (not a Menu, can't parse, length differs, write fails) | message on screen; the update still finishes with the old region | only on a successful write |
-| Final `MCP_LoadSysProdXML` fails | MCP "System update failed" with the step **still 0x13** (MCP sets it before the load). The plugin's hook records the load result, so the worker reports "sys_prod.xml load FAILED after the install" instead of success and stays on the SD | install done |
+| Final `MCP_LoadSysProdXML` fails | MCP "System update failed" with the step **still 0x13** (MCP sets it before the load). The plugin's hook records the load result, so the install thread reports "sys_prod.xml load FAILED after the install" instead of success and stays on the SD | install done |
 | Success | the plugin deletes itself **first**, then "system update was successful, plugin removed". MCP powers off right after its success line; on hardware the power-off log line came before the plugin's messages, but the delete still went through | yes |
 
 Cosmetic, left as is: "Updating from /vol/sdcard/wafel_install//..." The
@@ -457,13 +471,13 @@ It agrees with the USB-MLC hardware result above and adds:
 
 - Tested once on retail (see above); USB MLC not supported yet.
   `IOS_SetSecurityLevel(Test)` **is** refused on retail (confirmed in the kernel,
-  `0x081299e8`); the default `RECUPD_FORCE_TEST_LEVEL` patch handles that by
+  `0x081299e8`); the default `DRSETUP_FORCE_TEST_LEVEL` patch handles that by
   forcing MCP's `IOS_GetSecurityLevel` to Test instead.
 - It force-formats nothing by default, but `MCP_DR_SystemUpdateFromMedia` still
   **unmounts and reformats the MLC's WFS when it differs**, and always deletes
   `/vol/system_slc/security/versions.bin` (only when `wipe_slc` = 0; regenerated by the update).
 - An MLC that holds WFS from a *different* console may make the conditional
-  format's `GetVolumeInfo` fail; use `RECUPD_FORCE_FORMAT` to rebuild it.
+  format's `GetVolumeInfo` fail; use `DRSETUP_FORCE_FORMAT` to rebuild it.
 - `wipe_slc` is hard-coded to 0: the SLC (including `scfm.img`, `ivs.bin`,
   tickets, SLC system titles) is never touched.
 - The plugin enters recovery on **every** boot while present, so it deletes
