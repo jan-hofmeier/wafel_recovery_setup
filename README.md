@@ -1,4 +1,4 @@
-# wafel_recovery_update (`5recupd.ipx`)
+# wafel_recovery_setup (`5drsetup.ipx`)
 
 Boots IOS-MCP straight into its factory **Boot Recovery** mode and reinstalls
 titles from a **FAT32** SD card, reusing MCP's own recovery reinstall routine
@@ -13,6 +13,29 @@ rollback, not one-title-at-a-time `MCP_Install`.
 
 > **Tested on hardware (internal MLC, 2026-11-08): full system reinstall succeeds, recovery screen with progress bar on the TV, initial setup starts afterwards. USB MLC not supported yet. It can format the MLC.** Read the
 > risks below before running. Keep a full NAND/MLC backup.
+
+## Two versions
+
+(Renamed 2026-11-08: directory `wafel_recovery_update/` → `wafel_recovery_setup/`,
+`5recupd.ipx` → `5drsetup.ipx`, `5recins.ipx` → `5drinst.ipx`, SD log
+`wafel_recupd.log` → `wafel_drsetup.log`, message prefix `wafel_recupd:` →
+`drsetup:`. "dr" is MCP's own name for Boot Recovery: `MCP_DR_…`,
+`/dev/mcp_recovery`. Hardware test notes below that quote older log lines still
+show the old prefix.)
+
+Like `wafel_setup_mlc` (`main` vs. its `just_install` branch) there are two
+builds from the same source:
+
+| ipx | Build | What it does |
+|---|---|---|
+| `5drsetup.ipx` | `make` | **Full:** formats SLCCMPT/MLC if they have no valid file system, deletes `cafe.xml` (initial setup on the next boot), installs, fixes the region in `sys_prod.xml` |
+| `5drinst.ipx` | `make INSTALLONLY=1` | **Install only:** no format anywhere (all `bl MCP_FormatDevice` of recovery resume and the DR update except the ramdisk are replaced by a no-op), `cafe.xml` and region untouched; just the reinstall. A volume without a valid file system fails at the mount like a missing MLC. Deletes itself (`5drinst.ipx`) after success |
+
+Both share everything else (recovery entry, 1080p screen, success check,
+self-delete, messages). Run `make clean` between builds; `make clean` removes
+both `.ipx`. Hardware 2026-11-08: `5drinst.ipx` on the internal MLC — six
+formats skipped (only the ramdisk is formatted, as on every boot), install
+successful, no region step, plugin removed.
 
 ## What it does
 
@@ -38,7 +61,7 @@ rollback, not one-title-at-a-time `MCP_Install`.
 A normal FAT32 SD card:
 
 ```
-sd:/wiiu/ios_plugins/5recupd.ipx      <- this plugin
+sd:/wiiu/ios_plugins/5drsetup.ipx      <- this plugin
 sd:/wafel_install/                     <- package root (mounted at /vol/sdcard/wafel_install)
    <title 1>/  title.tmd title.tik title.cert *.app *.h3
    <title 2>/  ...
@@ -80,7 +103,7 @@ MCP only (not the kernel, ES, crypto or FS).
 | Blue blinking | worker running / install in progress |
 | Solid blue | success (plugin deleted itself) |
 | Orange | no `wafel_install` folder on SD — nothing done, recovery menu stays up |
-| Red / red blinking | FSA/open failure or the update failed (see `/vol/sdcard/wafel_recupd.log` and the on-screen line) |
+| Red / red blinking | FSA/open failure or the update failed (see `/vol/sdcard/wafel_drsetup.log` and the on-screen line) |
 
 ## Build
 
@@ -88,12 +111,12 @@ MCP only (not the kernel, ES, crypto or FS).
 STROOPWAFEL_ROOT=/home/jan/wiiu/stroopwafel DEVKITARM=/opt/devkitpro/devkitARM make
 ```
 
-Produces `5recupd.ipx`. Copy it to `sd:/wiiu/ios_plugins/`.
+Produces `5drsetup.ipx`. Copy it to `sd:/wiiu/ios_plugins/`.
 
 Test variants (run `make clean` before switching builds):
 
-- `make NOINSTALL=1`: boots into recovery, shows the screen and deletes
-  `cafe.xml`, but stops before the reinstall (orange LED) and prints
+- `make NOINSTALL=1`: boots into recovery and shows the screen, but changes
+  nothing (stops before the `cafe.xml` delete and the reinstall) (orange LED) and prints
   "TEST BUILD (NOINSTALL)" on the recovery screen. It does **not** delete itself,
   so every boot goes back into recovery.
 - `make REGIONTEST=1`: sets sys_prod's region to 2 (USA) before the install, so
@@ -115,6 +138,7 @@ guarded by an `expect` check of the original bytes.
 | 0x0510eaee | `movs r0,#0; nop` | skip the full-system-package check (omitted with `RECUPD_REQUIRE_FULL_SYSTEM`) |
 | 0x05059090 | `movs r0,#0xa; bx lr` | MCP `IOS_GetSecurityLevel` returns Test, so the update engine doesn't skip same-version titles (omitted with `RECUPD_KEEP_NORMAL_LEVEL`) |
 | bl @0x0510f88a | `trampoline_t_blreplace` | `bl MCP_ShowMenu` in the recovery thread: run it, log the menu surface, then start the worker |
+| 0x051003c4 | `movs r3,#0` (was `#1`) | `MCP_ShowMenu`: BSP `DC_INIT` id 0 (1080p) instead of id 1 (480p), see "Display" |
 | bl @0x0510f04c | `trampoline_t_blreplace` | `bl MCP_LoadSysProdXML` after a successful `MCP_SystemUpdate` (step 0x13): fix the region in `sys_prod.xml`, then run the original load (see "Region") |
 | bl @0x051003fe | `trampoline_t_blreplace` (found by scanning `MCP_ShowMenu`) | `bl MCP_InitMenu`: replace DC_CONFIG's framebuffer with the surface the TV scans out (read in `kern_main`), see "Display" |
 
@@ -133,7 +157,7 @@ Tested on the user's retail console with `00core`, `4usbmlc`, `5debug`, `5isfsha
    and that function dereferences `data` when it is non-NULL. Fixed: the plugin
    calls `MCP_fsaInit(NULL)` itself (`recupd_fsa_open`), once, and reuses the
    handle (each call takes one of MCP's 8 FSA client slots at `0x050a3c70`).
-3. **Open: with a USB MLC (`4usbmlc.ipx`) the reinstall fails at step 8**,
+3. **USB MLC (`4usbmlc.ipx`), first try: the reinstall failed at step 8** (fixed, see 9.),
    `mcp_recovery.c:414:failed to stop ES, err -196645` (`0xfffcffdb`). Cause:
    - PM resumes processes in order and blocks on each one. Recovery resume
      (`MCP_DRThreadEntry` case 0xd, `/dev/mcp_recovery` = process 33) calls
@@ -147,14 +171,17 @@ Tested on the user's retail console with `00core`, `4usbmlc`, `5debug`, `5isfsha
      `-1`, so `MCP_FSDelClient(-1)` in stop-ES (`0x0500fe28`) fails.
    - Normal boot uses the same 15 s value (`0x05027de0`), but it doesn't wait
      inside the PM resume.
-   - **Fix, implemented in `wafel_usb_mlc` (2026-11-08, not tested on
-     hardware yet):** a second hook next to its normal-boot
+   - **Fix, implemented in `wafel_usb_mlc` (2026-11-08, tested on hardware,
+     see 9.):** a second hook next to its normal-boot
      `mcp_mlc_wait_hook`, on the recovery resume's `bl wait_for_dev("/dev/mlc01")`
      at `0x0510f56e` (`f707fbb3`). It brings UMS up before the wait instead of
      after it:
      1. mount `/vol/system_slc` (recovery hasn't yet; `MCP_IVS_stuff` may read
         `security/ivs.bin`), call `MCP_IVS_stuff` (`0x0501c238`), unmount again
-        with `MCP_UnmountFS` (`0x05015b20`, flags `0x80000000`, as recovery does);
+        with `MCP_UnmountFS` (`0x05015b20`, flags `0x80000000`, as recovery does).
+        Both with recovery's FSA owner `{0,0,1,0}` (rodata `0x05066e6c`): with a
+        `NULL` owner the mount fails with `FSA_STATUS_PERMISSION_ERROR`
+        (`-0x3001a`, first hardware run);
      2. resume `/dev/usbproc2` and `/dev/ums` early (`resume_process`, same PM
         entries as normal boot);
      3. wait for `/dev/mlc01` in 1.5 s steps, capped at 5 minutes, so a missing
@@ -182,7 +209,7 @@ Tested on the user's retail console with `00core`, `4usbmlc`, `5debug`, `5isfsha
    - MCP then powers off at once (`Power Transition -> PM_OFF`). The plugin's
      success log, self-delete (`FSA_Remove` of the ipx) and flush still got
      through: the ipx was gone from the SD afterwards, and
-     `wafel_recupd.log` was written.
+     `wafel_drsetup.log` was written.
    - The recovery screen wasn't visible and the next boot hung at the Wii U logo;
      both fixed, see "Display" and "Initial setup" below.
 5. **Final run** (display fix + `initial_launch` reset, MLC already WFS, so no
@@ -198,6 +225,26 @@ Tested on the user's retail console with `00core`, `4usbmlc`, `5debug`, `5isfsha
    REGIONTEST with the in-place write: 2 written, 4 written back, sys_prod load
    0, success. Release run: "already matches", load 0, plugin removed after the
    power-off line.
+9. **USB MLC** (2026-11-08, `4usbmlc` with the recovery hook):
+   - 190 GB HDD: hook resumed USBPROC2/UMS, `mlc01` after ~7 s, raw drive
+     formatted, install successful (2 min 42 s). The next two runs (reinstall
+     over it) failed at step 0x20: `FSA: ### DATA CORRUPTION ERROR ###,
+     dev:mlc01, err:-1245211, path:/sys/title/00050030/10017209/code/app.xml`,
+     already during recovery's title scan, then "Rollback system quota". The user
+     suspects a faulty HDD and swapped it.
+   - 7.4 GB flash drive: `mlc01` after ~6 s, formatted, install successful
+     (6 min 46 s), plugin removed. Normal boot with `4usbmlc`: **initial setup**
+     (so the drive was set up with the key normal boot uses).
+   - Together with `01scrlog.ipx`: before `MCP_ShowMenu` the plugin sets the
+     screen log's exported `scrlog_bottom_only` (`wafel_find_symbol`, then
+     100 ms for a running redraw), so the log only draws its bottom box and never
+     re-initialises the TV. User: menu fine, box readable, the log text slightly
+     blurry: DC_INIT id 1 is 480p. Fixed by using id 0 (1080p), see "Display";
+     then menu and log both sharp. Without the flag both drew full screen and the screen log
+     re-initialised the TV after DC_INIT.
+   - The screen log read the D1 surface register as `0x14001001` after
+     `DC_INIT`, while the TV still showed `0x17500000`: DC_INIT does write the
+     address, it just never takes effect (not latched).
 
 ## Display: why the menu was invisible, and the fix
 
@@ -227,6 +274,13 @@ Hardware, 2026-11-08 (TV, minute had shown its menu before booting IOSU):
 - `MCP_ShowMenu` calls BSP through Thumb→ARM thunks (`bl 0x05059570` /
   `0x05059568`), and stroopwafel's Thumb `blreplace` only handles `BL`, so the hook
   sits on `bl MCP_InitMenu` (`0x051003fe`), not on the `DC_CONFIG` read.
+- **Video mode (1080p):** `MCP_ShowMenu` passes `DC_INIT` id 1. BSP's id-1
+  tables (`dc1`) program **480p** timing (H/V total 858×525, `0x6000`/`0x6020`
+  = `0x359`/`0x20c`), so the 1280×720 surface is scaled down and thin text gets
+  blurry (minute's leftover text, the screen log's 8×8 font). Id 0 (`dc0`) is
+  **1080p** (2200×1125, `0x897`/`0x464`), same PLLs and the same 1280×720
+  surface, and the timing minute uses. The plugin patches `movs r3,#1` at
+  `0x051003c4` to `#0`. Hardware: menu and screen-log box both sharp.
 - If the TV wasn't scanning out a usable surface at `kern_main` (e.g. minute
   autoboot without showing anything), the plugin changes nothing and MCP uses
   `0x14001000` as on a factory console. Not tested.
@@ -318,9 +372,9 @@ the user suggested: the end of the recovery update.
 
 ## What happens on errors
 
-Every plugin message goes to `/vol/sdcard/wafel_recupd.log` **and** the
+Every plugin message goes to `/vol/sdcard/wafel_drsetup.log` **and** the
 recovery screen's text area (`DrCon_Printf` `0x05110de4`), prefixed
-`wafel_recupd:`. The plugin deletes itself only after a full success; in every
+`drsetup:`. The plugin deletes itself only after a full success; in every
 other case it stays on the SD, so each boot goes back into recovery and retries
 until the update succeeds or the `.ipx` is removed.
 

@@ -1,5 +1,5 @@
 /*
- * wafel_recovery_update (5recupd.ipx)
+ * wafel_recovery_setup (5drsetup.ipx)
  *
  * Boots IOS-MCP straight into its factory "Boot Recovery" mode and reinstalls
  * titles from a FAT32 SD card, reusing MCP's own recovery reinstall routine
@@ -93,7 +93,7 @@ static int expect32(uintptr_t addr, u32 expected)
     volatile u16 *p = (volatile u16 *)ios_elf_vaddr_to_paddr(addr);
     u32 val = ((u32)p[0] << 16) | p[1];
     if (val != expected) {
-        debug_printf("wafel_recupd: %08X is %08X, expected %08X\n",
+        debug_printf("drsetup: %08X is %08X, expected %08X\n",
                      addr, val, expected);
         return 0;
     }
@@ -104,7 +104,7 @@ static int expect16(uintptr_t addr, u16 expected)
 {
     u16 val = *(u16 *)ios_elf_vaddr_to_paddr(addr);
     if (val != expected) {
-        debug_printf("wafel_recupd: %08X is %04X, expected %04X\n",
+        debug_printf("drsetup: %08X is %04X, expected %04X\n",
                      addr, val, expected);
         return 0;
     }
@@ -145,8 +145,8 @@ static void recupd_log(int fsa, const char *msg)
 /* log to the SD and print on the recovery screen (MCP's text console) */
 static void recupd_say(int fsa, const char *msg)
 {
-    debug_printf("wafel_recupd: %s\n", msg);
-    DrCon_Printf("wafel_recupd: %s\n", msg);
+    debug_printf("drsetup: %s\n", msg);
+    DrCon_Printf("drsetup: %s\n", msg);
     recupd_log(fsa, msg);
 }
 
@@ -170,7 +170,7 @@ static void recupd_set_initial_launch(int fsa)
 {
     int r = FSA_Remove(fsa, CAFE_XML);
     int f = FSA_FlushVolume(fsa, "/vol/system_slc");
-    debug_printf("wafel_recupd: remove %s: %X, flush %X\n", CAFE_XML, r, f);
+    debug_printf("drsetup: remove %s: %X, flush %X\n", CAFE_XML, r, f);
     if (r == 0)
         recupd_log(fsa, "deleted cafe.xml (initial setup on next boot)");
     else if (r == (int)0xFFFCFFE9)      /* FSA "not found": already gone */
@@ -249,7 +249,7 @@ static void sysprod_set_region(int fsa, u32 region)
     int la = 0, lg = 0;
     u32 va = pa >= 0 ? xml_u32(in, n, pa, &la) : 0;
     u32 vg = gr >= 0 ? xml_u32(in, n, gr, &lg) : 0;
-    debug_printf("wafel_recupd: sys_prod product_area %u game_region %u, wanted %u\n",
+    debug_printf("drsetup: sys_prod product_area %u game_region %u, wanted %u\n",
                  va, vg, region);
     if (pa < 0 || gr < 0 || !la || !lg || n >= 0xfc0) {
         recupd_say(fsa, "region: FAILED to parse sys_prod.xml, region unchanged");
@@ -272,7 +272,7 @@ static void sysprod_set_region(int fsa, u32 region)
             FSA_CloseFile(fsa, h);
         }
         int f = FSA_FlushVolume(fsa, "/vol/system_slc");
-        debug_printf("wafel_recupd: wrote sys_prod.xml region %u: %d of %d bytes, flush %X\n",
+        debug_printf("drsetup: wrote sys_prod.xml region %u: %d of %d bytes, flush %X\n",
                      region, w, n, f);
         recupd_say(fsa, w == n ? "region: sys_prod product_area/game_region set to the Wii U Menu's region"
                                : "region: FAILED to write sys_prod.xml");
@@ -285,7 +285,7 @@ static void recupd_fix_region(int fsa)
 {
     u64 title = 0, os = 0;
     MCP_SysCfg_GetDefaultTitle(&title, &os);
-    debug_printf("wafel_recupd: coldboot title %08X%08X\n", (u32)(title >> 32), (u32)title);
+    debug_printf("drsetup: coldboot title %08X%08X\n", (u32)(title >> 32), (u32)title);
     /* (wafel_setup_mlc's version of this check can't fail: "&" binds weaker than "!=") */
     if ((title & 0xFFFFFFFFFFFFF0FFull) != 0x0005001010040000ull) {
         recupd_say(fsa, "region: coldboot title is not a Wii U Menu, region unchanged");
@@ -310,11 +310,13 @@ static volatile int g_sysprod_load = 1;
 static int recupd_loadsysprod(int r0, int r1, int r2, int r3, int (*org)(void))
 {
     (void)r0; (void)r1; (void)r2; (void)r3;
+#ifndef RECUPD_INSTALL_ONLY
     if (g_fsa >= 0)
         recupd_fix_region(g_fsa);
+#endif
     int ret = org();
     g_sysprod_load = ret;
-    debug_printf("wafel_recupd: MCP_LoadSysProdXML returned %d\n", ret);
+    debug_printf("drsetup: MCP_LoadSysProdXML returned %d\n", ret);
     return ret;
 }
 
@@ -325,7 +327,7 @@ static u32 recupd_main(void *arg)
     /* let the recovery screen and the SLC/MLC mounts settle */
     msleep(5000);
     SetNotificationLED(NOTIF_LED_BLUE | NOTIF_LED_BLUE_BLINKING);
-    debug_printf("wafel_recupd: worker start\n");
+    debug_printf("drsetup: worker start\n");
 
     int fsa = -1;
     for (int i = 0; i < 20 && fsa < 0; i++) {
@@ -334,19 +336,19 @@ static u32 recupd_main(void *arg)
     }
     g_fsa = fsa;
     if (fsa < 0) {
-        debug_printf("wafel_recupd: FSA_Open failed %d\n", fsa);
+        debug_printf("drsetup: FSA_Open failed %d\n", fsa);
         SetNotificationLED(NOTIF_LED_RED | NOTIF_LED_RED_BLINKING);
         return 0;
     }
 
     wait_for_dev("/dev/sdcard01", 10000000);
     int ret = FSA_Mount(fsa, "/dev/sdcard01", RECUPD_SD_MOUNT, 0, NULL, 0);
-    debug_printf("wafel_recupd: mount sd %d\n", ret);
+    debug_printf("drsetup: mount sd %d\n", ret);
 
     /* require the install folder, otherwise leave the console untouched */
     int dir = -1;
     if (FSA_OpenDir(fsa, RECUPD_INSTALL_DIR, &dir) != 0) {
-        debug_printf("wafel_recupd: no %s on SD\n", RECUPD_INSTALL_DIR);
+        debug_printf("drsetup: no %s on SD\n", RECUPD_INSTALL_DIR);
         recupd_say(fsa, "no wafel_install folder on SD, nothing installed");
         SetNotificationLED(NOTIF_LED_ORANGE);
         FSA_Unmount(fsa, RECUPD_SD_MOUNT, 0);
@@ -354,23 +356,27 @@ static u32 recupd_main(void *arg)
         return 0;   /* recovery menu stays on screen */
     }
     FSA_CloseDir(fsa, dir);
-    recupd_set_initial_launch(fsa);
-
-#ifdef RECUPD_REGION_TEST
-    /* test build (make REGIONTEST=1): break the region (USA) so the fix after
-     * the install has to write it back */
-    debug_printf("wafel_recupd: REGIONTEST build, setting sys_prod region to 2\n");
-    sysprod_set_region(fsa, 2);
-#endif
-
 #ifdef RECUPD_NO_INSTALL
     /* test build (make NOINSTALL=1): show the recovery screen, install nothing */
-    debug_printf("wafel_recupd: NOINSTALL build, not installing\n");
-    DrCon_Printf("wafel_recupd TEST BUILD (NOINSTALL): nothing installed\n");
+    debug_printf("drsetup: NOINSTALL build, not installing\n");
+    DrCon_Printf("drsetup TEST BUILD (NOINSTALL): nothing installed\n");
     SetNotificationLED(NOTIF_LED_ORANGE);
     iosClose(fsa);
     return 0;
 #endif
+#ifdef RECUPD_INSTALL_ONLY
+    recupd_say(fsa, "install only: no format, cafe.xml and region unchanged");
+#else
+    recupd_set_initial_launch(fsa);
+#endif
+
+#ifdef RECUPD_REGION_TEST
+    /* test build (make REGIONTEST=1): break the region (USA) so the fix after
+     * the install has to write it back */
+    debug_printf("drsetup: REGIONTEST build, setting sys_prod region to 2\n");
+    sysprod_set_region(fsa, 2);
+#endif
+
     recupd_log(fsa, "starting recovery reinstall from " RECUPD_INSTALL_DIR);
 
     /*
@@ -394,12 +400,12 @@ static u32 recupd_main(void *arg)
          * cut into the message that came before the delete */
         int rm = FSA_Remove(fsa, RECUPD_IPX_PATH);
         FSA_FlushVolume(fsa, RECUPD_SD_MOUNT);
-        debug_printf("wafel_recupd: success, plugin removed %X\n", rm);
+        debug_printf("drsetup: success, plugin removed %X\n", rm);
         recupd_say(fsa, rm == 0 ? "system update was successful, plugin removed"
                                 : "system update was successful, FAILED to remove the plugin");
         SetNotificationLED(NOTIF_LED_BLUE);
     } else {
-        debug_printf("wafel_recupd: failed at step 0x%X\n", step);
+        debug_printf("drsetup: failed at step 0x%X\n", step);
         char line[48];
         const char *p = "system update FAILED at step 0x";
         int n = 0;
@@ -421,13 +427,13 @@ static void start_worker(void)
 {
     u8 *stack = (u8 *)iosAllocAligned(0x0001, 0x8000, 0x20);
     if (!stack) {
-        debug_printf("wafel_recupd: worker stack alloc failed\n");
+        debug_printf("drsetup: worker stack alloc failed\n");
         return;
     }
     int th = iosCreateThread(recupd_main, NULL, (u32 *)(stack + 0x8000),
                              0x8000, 0x78, 1);
     if (th < 0) {
-        debug_printf("wafel_recupd: create worker failed %d\n", th);
+        debug_printf("drsetup: create worker failed %d\n", th);
         return;
     }
     iosStartThread(th);
@@ -476,7 +482,7 @@ static void recupd_initmenu(s32 w, s32 h, s32 pitch, s32 format,
 {
     (void)lr;
     if (tv_surface && pixels != tv_surface) {
-        debug_printf("wafel_recupd: DC_CONFIG fb %08X, TV scans out %08X: drawing there\n",
+        debug_printf("drsetup: DC_CONFIG fb %08X, TV scans out %08X: drawing there\n",
                      pixels, tv_surface);
         pixels = tv_surface;
     }
@@ -502,7 +508,7 @@ static void patch_menu_surface(void)
 {
     u32 en = abif_gpu_read32_k(D1GRPH_ENABLE);
     u32 surf = abif_gpu_read32_k(D1GRPH_PRIMARY_SURFACE) & ~0xffu;
-    debug_printf("wafel_recupd: TV D1 enable %08X surface %08X\n", en, surf);
+    debug_printf("drsetup: TV D1 enable %08X surface %08X\n", en, surf);
     if ((en & 1) && surf >= 0x14000000 && surf + 1280 * 720 * 4 <= 0x1d000000)
         tv_surface = surf;
 
@@ -512,7 +518,7 @@ static void patch_menu_surface(void)
         u32 t = thumb_bl_target(a, &blx);
         if (!t)
             continue;
-        debug_printf("wafel_recupd: MCP_ShowMenu %08X: %s %08X\n", a, blx ? "blx" : "bl", t);
+        debug_printf("drsetup: MCP_ShowMenu %08X: %s %08X\n", a, blx ? "blx" : "bl", t);
         if (!blx && t == ADDR_MCP_INITMENU && !done) {
             trampoline_t_blreplace(a, recupd_initmenu);
             done = 1;
@@ -520,19 +526,64 @@ static void patch_menu_surface(void)
         a += 2;
     }
     if (!done)
-        debug_printf("wafel_recupd: bl MCP_InitMenu not found, menu may stay invisible\n");
+        debug_printf("drsetup: bl MCP_InitMenu not found, menu may stay invisible\n");
 }
 
 /* replaces the recovery thread's "bl MCP_ShowMenu" (0x0510f88a) */
 static int recupd_showmenu(int r0, int r1, int r2, int r3, int (*org)(void))
 {
     (void)r0; (void)r1; (void)r2; (void)r3;
+    /* wafel_screen_log (if loaded) draws into the same buffer: from now on
+     * only its bottom box, so it doesn't paint over the recovery menu or
+     * re-initialise the TV after DC_INIT. Wait two of its 50 ms frames so a
+     * full redraw already running has finished. */
+    volatile int *scrlog_bottom = (volatile int *)wafel_find_symbol("scrlog_bottom_only");
+    if (scrlog_bottom) {
+        *scrlog_bottom = 1;
+        msleep(100);
+        debug_printf("drsetup: screen log switched to the bottom box\n");
+    }
     int ret = org();
-    debug_printf("wafel_recupd: menu %ux%u fb %08X\n",
+    debug_printf("drsetup: menu %ux%u fb %08X\n",
                  MCP_MENU[0x28 / 4], MCP_MENU[0x2c / 4], MCP_MENU[0x50 / 4]);
     start_worker();
     return ret;
 }
+
+/*
+ * Write one Thumb halfword at kernel time. Don't use ASM_T_PATCH_K for 2-byte
+ * patches: it assembles the Thumb snippet inline in this ARM function and
+ * switches back to .arm without realigning, so the ARM code after a 2-byte
+ * snippet is shifted by 2 bytes (undefined instruction on hardware). The old
+ * four 2-byte patches only worked because they added up to 8 bytes.
+ */
+static void patch16_k(uintptr_t addr, u16 val)
+{
+    memcpy16((void *)ios_elf_vaddr_to_paddr(addr), &val, sizeof(val));
+}
+
+#ifdef RECUPD_INSTALL_ONLY
+/*
+ * Install only: no format anywhere. Replaces every bl MCP_FormatDevice
+ * (0x050160d8) of the recovery thread's resume (slc01, mlc01, slccmpt01; the
+ * ramdisk one at 0x0510f65e stays) and of MCP_DR_SystemUpdateFromMedia
+ * (slccmpt, slc, mlc). A volume without a valid file system then fails at the
+ * mount, the same way as a missing MLC, and nothing is formatted.
+ */
+static const uintptr_t format_calls[] = {
+    0x0510f59e, 0x0510f5b8, 0x0510f5ce,     /* resume: slc01, mlc01, slccmpt01 */
+    0x0510ec3a, 0x0510ecd6, 0x0510ed98,     /* DR update: slccmpt, slc, mlc */
+};
+
+static int recupd_no_format(const char *dev, const char *fs, int force, int r3,
+                            int (*org)(const char *, const char *, int))
+{
+    (void)r3; (void)org;
+    debug_printf("drsetup: install only, not formatting %s (%s, force %d)\n",
+                 dev, fs, force);
+    return 0;
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* kernel-time patches                                                 */
@@ -540,7 +591,7 @@ static int recupd_showmenu(int r0, int r1, int r2, int r3, int (*org)(void))
 __attribute__((target("arm")))
 void kern_main(void)
 {
-    debug_printf("wafel_recovery_update kern %p\n", kern_main);
+    debug_printf("wafel_recovery_setup kern %p\n", kern_main);
 
     /* don't halt the system on a kernel panic */
     ASM_PATCH_K(ADDR_KERN_PANIC, "bx lr\n");
@@ -572,19 +623,27 @@ void kern_main(void)
         U32_PATCH_K(ADDR_MCP_GETSECLEVEL, 0x200a4770);
 #endif
 
-#ifndef RECUPD_FORCE_FORMAT
+#ifdef RECUPD_INSTALL_ONLY
+    for (unsigned i = 0; i < sizeof(format_calls) / sizeof(format_calls[0]); i++) {
+        int blx = 0;
+        if (thumb_bl_target(format_calls[i], &blx) == 0x050160d8 && !blx)
+            trampoline_t_blreplace(format_calls[i], recupd_no_format);
+        else
+            debug_printf("drsetup: %08X is not bl MCP_FormatDevice\n", format_calls[i]);
+    }
+#elif !defined(RECUPD_FORCE_FORMAT)
     /* make the recovery reinstall's formats conditional (force=false) */
     if (expect16(ADDR_FMT_SLCCMPT, ORIG_FMT_FORCE))
-        ASM_T_PATCH_K(ADDR_FMT_SLCCMPT, ".short 0x2200\n");   /* movs r2,#0 */
+        patch16_k(ADDR_FMT_SLCCMPT, 0x2200);   /* movs r2,#0 */
     if (expect16(ADDR_FMT_MLC, ORIG_FMT_FORCE))
-        ASM_T_PATCH_K(ADDR_FMT_MLC, ".short 0x2200\n");
+        patch16_k(ADDR_FMT_MLC, 0x2200);
     if (expect16(ADDR_FMT_SLC, ORIG_FMT_FORCE))
-        ASM_T_PATCH_K(ADDR_FMT_SLC, ".short 0x2200\n");
+        patch16_k(ADDR_FMT_SLC, 0x2200);
 #endif
 
     /* always skip ticket deletion: b 0x0510f0c0 (0xE0BA) */
     if (expect16(ADDR_TICKET_SKIP, ORIG_TICKET_SKIP))
-        ASM_T_PATCH_K(ADDR_TICKET_SKIP, ".short 0xe0ba\n");
+        patch16_k(ADDR_TICKET_SKIP, 0xe0ba);
 
 #ifdef RECUPD_SKIP_BOOTTITLE_CHECK
     /* allow any set of WUPs (skip the full-system-package check) */
@@ -597,6 +656,16 @@ void kern_main(void)
         trampoline_t_blreplace(ADDR_LOAD_SYSPROD_CALL, recupd_loadsysprod);
         g_sysprod_hooked = 1;
     }
+
+    /*
+     * Recovery screen in 1080p like minute: MCP_ShowMenu passes DC_INIT id 1
+     * (movs r3,#1 at 0x051003c4), whose BSP tables (dc1) program 480p timing
+     * (H/V total 858x525), so the 1280x720 surface is scaled down and thin text
+     * gets blurry. Id 0 (dc0) is 1080p (2200x1125), same PLLs, same 1280x720
+     * surface, the same timing minute uses.
+     */
+    if (expect16(0x051003c4, 0x2301))
+        patch16_k(0x051003c4, 0x2300);      /* movs r3,#0 */
 
     /* draw the recovery screen into the surface the TV really scans out */
     patch_menu_surface();

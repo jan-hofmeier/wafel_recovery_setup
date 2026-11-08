@@ -2,7 +2,7 @@
 #define RECUPD_CONFIG_H
 
 /*
- * Compile-time options for wafel_recovery_update.
+ * Compile-time options for wafel_recovery_setup.
  * Override from the Makefile with EXTRA_CFLAGS, e.g.
  *   make EXTRA_CFLAGS="-DRECUPD_FORCE_FORMAT"
  */
@@ -47,9 +47,13 @@
 /* SD directory that holds one WUP-style folder per title. */
 #define RECUPD_SD_MOUNT     "/vol/sdcard"
 #define RECUPD_INSTALL_DIR  "/vol/sdcard/wafel_install"
-#define RECUPD_LOG_PATH     "/vol/sdcard/wafel_recupd.log"
+#define RECUPD_LOG_PATH     "/vol/sdcard/wafel_drsetup.log"
 /* self-delete after a successful run so the next boot is normal */
-#define RECUPD_IPX_PATH     "/vol/sdcard/wiiu/ios_plugins/5recupd.ipx"
+#ifdef RECUPD_INSTALL_ONLY
+#define RECUPD_IPX_PATH     "/vol/sdcard/wiiu/ios_plugins/5drinst.ipx"
+#else
+#define RECUPD_IPX_PATH     "/vol/sdcard/wiiu/ios_plugins/5drsetup.ipx"
+#endif
 
 /* We never wipe the SLC. */
 #define RECUPD_WIPE_SLC     0

@@ -14,7 +14,11 @@ include $(MAKEFILE_ROOT_DIR)/elf_rules
 # INCLUDES is a list of directories containing header files
 # SPECS is the directory containing the important build and link files
 #---------------------------------------------------------------------------------
-export TARGET		:=	5recupd
+export TARGET		:=	5drsetup
+# make INSTALLONLY=1: only reinstall (no format, no cafe.xml delete, no region fix)
+ifeq ($(INSTALLONLY),1)
+export TARGET		:=	5drinst
+endif
 export BUILD		?=	debug
 
 R_SOURCES			:=
@@ -36,6 +40,9 @@ CFLAGS			:=	-g -std=c11 -Os \
 
 CFLAGS			+=	$(INCLUDE) -D_GNU_SOURCE -DCAN_HAZ_IRQ -fno-builtin-printf -Wno-nonnull -Werror=implicit
 
+ifeq ($(INSTALLONLY),1)
+CFLAGS			+=	-DRECUPD_INSTALL_ONLY
+endif
 ifeq ($(REGIONTEST),1)
 CFLAGS			+=	-DRECUPD_REGION_TEST
 endif
