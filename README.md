@@ -29,7 +29,41 @@ builds from the same source:
 | ipx | Build | What it does |
 |---|---|---|
 | `5drsetup.ipx` | `make` | **Full:** formats SLCCMPT/MLC if they have no valid file system, deletes `cafe.xml` (initial setup on the next boot), installs, fixes the region in `sys_prod.xml` |
-| `5drinst.ipx` | `make INSTALLONLY=1` | **Install only:** no format anywhere (all `bl MCP_FormatDevice` of recovery resume and the DR update except the ramdisk are replaced by a no-op), `cafe.xml` and region untouched; just the reinstall. A volume without a valid file system fails at the mount like a missing MLC. Deletes itself (`5drinst.ipx`) after success |
+| `5drinst.ipx` | `make INSTALLONLY=1` | **Install only:** no format anywhere, `cafe.xml` and region untouched; just the reinstall. A volume without a valid file system fails at the mount like a missing MLC. Deletes itself (`5drinst.ipx`) after success |
+
+Formats, per build (each blocked `bl MCP_FormatDevice` is replaced by a no-op
+returning 0; the ramdisk format is never blocked):
+
+| Build | SLC (`0x0510f59e` resume, `0x0510ecd6` DR update) | MLC, SLCCMPT |
+|---|---|---|
+| `make` | **blocked** | conditional (only without a valid file system) |
+| `make INSTALLONLY=1` | **blocked** | blocked |
+| add `SLCFORMAT=1` | conditional, for rebuilding a blank SLC | as above |
+
+**Both builds repair the SLC before the install** (`recupd_prepare_slc`, see
+`docs/slc_minimum_for_recovery.md` in the IOSU notes):
+- `system.xml` missing → MCP's own `MCP_WriteDefaultSystemConfig(1)`
+  (`0x050049c0`, Thumb), which stock MCP only calls after a full SLC wipe.
+- `cert.sys` missing or without all of `CA00000003`, `CP0000000b`,
+  `XS0000000c` → the first `title.cert` found in the package (every WUP's holds
+  exactly these three) is merged with ES's own `esMergeCertSys` (`0x05050448`,
+  ARM; fills an empty store or adds the missing certs via `/tmp/cert.sys` +
+  rename). If `cert.sys` doesn't exist at all it is written directly.
+- `sys_prod.xml` needs nothing: MCP rebuilds it from the SEEPROM.
+
+**Rebuilding a blank SLC** (hardware-tested on redNAND, 2026-11-09): put the
+MLC titles **and OSv10** (`000500101000400a`) into `wafel_install`, boot
+without an isfshax plugin and use `make SLCFORMAT=1` where SCFM doesn't
+format the SLC itself (redNAND with SCFM disabled). The core needs the redNAND
+fix for the SLC spare-area ops (stroopwafel `rednand.c`,
+`rednand_slc_spare_read` / `rednand_slc_mark_bad`); without it the ISFS
+format jumps to 0. Result: SLC formatted, `system.xml` and `cert.sys`
+restored by the plugin, `sys_prod.xml` from SEEPROM, all titles incl. OSv10
+installed; the next boot loads the IOS from the new SLC and starts the initial
+setup. Details in the IOSU notes, `docs/slc_minimum_for_recovery.md`.
+
+Test switch `DELTEST=1`: deletes `sys_prod.xml`, `cert.sys`, `title.list`
+and `system.xml` (with flush and check) at the start of the worker.
 
 Both share everything else (recovery entry, 1080p screen, success check,
 self-delete, messages). Run `make clean` between builds; `make clean` removes

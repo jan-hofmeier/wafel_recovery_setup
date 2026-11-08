@@ -320,6 +320,127 @@ static int recupd_loadsysprod(int r0, int r1, int r2, int r3, int (*org)(void))
     return ret;
 }
 
+/*
+ * Missing SLC files that the reinstall needs (docs/slc_minimum_for_recovery.md):
+ *  - system.xml: no fallback in MCP_LoadSysconfig; the Menu install would
+ *    write a mostly-zero one. Write MCP's own defaults with
+ *    MCP_WriteDefaultSystemConfig(1) (0x050049c0, Thumb; stock MCP only calls
+ *    it after a full SLC wipe), only if the file doesn't exist.
+ *  - rights/sys/cert.sys: ES creates it empty but TMD verification needs
+ *    CP0000000b from it ("Failed to find cert, Root-CA00000003-CP0000000b",
+ *    hardware). Every WUP's title.cert holds the three certs (CA00000003,
+ *    CP0000000b, XS0000000c). If one is missing, merge a title.cert from the
+ *    package with ES's own esMergeCertSys (0x05050448, ARM: fills an empty
+ *    store or adds missing certs through /tmp/cert.sys + rename). It needs
+ *    the file to exist (ES creates it at startup); otherwise write it directly.
+ */
+#define SYSTEM_XML  "/vol/system_slc/config/system.xml"
+#define CERT_SYS    "/vol/system_slc/rights/sys/cert.sys"
+typedef void (*write_default_syscfg_fn)(u32 overwrite);
+#define MCP_WriteDefaultSystemConfig ((write_default_syscfg_fn)(0x050049c0 | 1))
+typedef int (*es_merge_cert_fn)(const void *certs, u32 size);
+#define esMergeCertSys ((es_merge_cert_fn)0x05050448)
+
+static int read_file(int fsa, const char *path, char *buf, int max)
+{
+    int h = -1;
+    int r = FSA_OpenFile(fsa, path, "r", &h);
+    if (r || h < 0)
+        return r ? r : -1;
+    int n = FSA_ReadFile(fsa, buf, 1, max, h, 0);
+    FSA_CloseFile(fsa, h);
+    return n;
+}
+
+static int has_str(const char *b, int n, const char *s)
+{
+    int l = 0;
+    while (s[l]) l++;
+    for (int i = 0; i + l <= n; i++) {
+        int k = 0;
+        while (k < l && b[i + k] == s[k]) k++;
+        if (k == l)
+            return 1;
+    }
+    return 0;
+}
+
+static int certs_complete(const char *b, int n)
+{
+    return n > 0 && has_str(b, n, "CA00000003") && has_str(b, n, "CP0000000b")
+        && has_str(b, n, "XS0000000c");
+}
+
+static void recupd_prepare_slc(int fsa)
+{
+    char *buf = (char *)iosAllocAligned(0xCAFF, 0x4000, 0x40);
+    char *path = (char *)iosAllocAligned(0xCAFF, 0x300, 0x40);
+    if (!buf || !path) {
+        recupd_say(fsa, "prepare SLC: out of memory");
+        goto out;
+    }
+
+    /* system.xml */
+    int n = read_file(fsa, SYSTEM_XML, buf, 0x4000);
+    if (n == (int)0xFFFCFFE9) {         /* FSA "not found" */
+        MCP_WriteDefaultSystemConfig(1);
+        FSA_FlushVolume(fsa, "/vol/system_slc");
+        n = read_file(fsa, SYSTEM_XML, buf, 0x4000);
+        debug_printf("drsetup: wrote default system.xml: now %d bytes\n", n);
+        recupd_say(fsa, n > 0 ? "system.xml was missing, wrote MCP's defaults"
+                              : "system.xml missing and writing defaults FAILED");
+    }
+
+    /* cert.sys */
+    n = read_file(fsa, CERT_SYS, buf, 0x4000);
+    if (certs_complete(buf, n))
+        goto out;
+    int exists = n >= 0;
+    debug_printf("drsetup: cert.sys %s (%d), CA/CP/XS incomplete\n",
+                 exists ? "present" : "missing", n);
+
+    /* title.cert of the first package folder that has one */
+    int dir = -1, c = -1;
+    if (FSA_OpenDir(fsa, RECUPD_INSTALL_DIR, &dir) == 0) {
+        FSDirectoryEntry *e = (FSDirectoryEntry *)iosAlloc(0xCAFF, sizeof(FSDirectoryEntry));
+        while (e && c <= 0 && FSA_ReadDir(fsa, dir, e) == 0) {
+            const char *parts[] = { RECUPD_INSTALL_DIR "/", e->name, "/title.cert" };
+            int o = 0;
+            for (int p = 0; p < 3; p++)
+                for (const char *q = parts[p]; *q && o < 0x2ff; q++)
+                    path[o++] = *q;
+            path[o] = 0;
+            c = read_file(fsa, path, buf, 0x4000);
+        }
+        if (e) iosFree(0xCAFF, e);
+        FSA_CloseDir(fsa, dir);
+    }
+    if (c <= 0 || !certs_complete(buf, c)) {
+        recupd_say(fsa, "cert.sys incomplete and no usable title.cert in the package");
+        goto out;
+    }
+    int r;
+    if (exists) {
+        r = esMergeCertSys(buf, c);
+        debug_printf("drsetup: esMergeCertSys(%s, %d) = %d\n", path, c, r);
+    } else {
+        int h = -1;
+        r = FSA_OpenFile(fsa, CERT_SYS, "w", &h);
+        if (r == 0 && h >= 0) {
+            r = FSA_WriteFile(fsa, buf, 1, c, h, 0) == c ? 0 : -1;
+            FSA_CloseFile(fsa, h);
+        }
+        debug_printf("drsetup: wrote cert.sys from %s: %d\n", path, r);
+    }
+    FSA_FlushVolume(fsa, "/vol/system_slc");
+    n = read_file(fsa, CERT_SYS, buf, 0x4000);
+    recupd_say(fsa, certs_complete(buf, n) ? "cert.sys was incomplete, restored it from the package's title.cert"
+                                           : "restoring cert.sys FAILED");
+out:
+    if (buf) iosFree(0xCAFF, buf);
+    if (path) iosFree(0xCAFF, path);
+}
+
 static u32 recupd_main(void *arg)
 {
     (void)arg;
@@ -364,6 +485,31 @@ static u32 recupd_main(void *arg)
     iosClose(fsa);
     return 0;
 #endif
+#ifdef RECUPD_DELETE_TEST
+    /* test build (make DELTEST=1): delete the files MCP/ES should recreate
+     * (docs/slc_minimum_for_recovery.md), flush, and check they are gone */
+    {
+        static const char *const del[] = {
+            "/vol/system_slc/config/sys_prod.xml",
+            "/vol/system_slc/rights/sys/cert.sys",
+            "/vol/system_slc/rights/sys/title.list",
+            "/vol/system_slc/config/system.xml",
+        };
+        for (unsigned i = 0; i < sizeof(del) / sizeof(del[0]); i++) {
+            int r = FSA_Remove(fsa, del[i]);
+            debug_printf("drsetup: DELTEST remove %s: %X\n", del[i], r);
+        }
+        int f = FSA_FlushVolume(fsa, "/vol/system_slc");
+        for (unsigned i = 0; i < sizeof(del) / sizeof(del[0]); i++) {
+            int h = -1;
+            int r = FSA_OpenFile(fsa, del[i], "r", &h);
+            if (r == 0 && h >= 0) FSA_CloseFile(fsa, h);
+            debug_printf("drsetup: DELTEST %s now %s (open %X), flush %X\n",
+                         del[i], r == 0 ? "STILL THERE" : "gone", r, f);
+        }
+        recupd_say(fsa, "DELTEST: deleted sys_prod.xml, cert.sys, title.list, system.xml");
+    }
+#endif
 #ifdef RECUPD_INSTALL_ONLY
     recupd_say(fsa, "install only: no format, cafe.xml and region unchanged");
 #else
@@ -377,6 +523,7 @@ static u32 recupd_main(void *arg)
     sysprod_set_region(fsa, 2);
 #endif
 
+    recupd_prepare_slc(fsa);
     recupd_log(fsa, "starting recovery reinstall from " RECUPD_INSTALL_DIR);
 
     /*
@@ -562,28 +709,51 @@ static void patch16_k(uintptr_t addr, u16 val)
     memcpy16((void *)ios_elf_vaddr_to_paddr(addr), &val, sizeof(val));
 }
 
-#ifdef RECUPD_INSTALL_ONLY
 /*
- * Install only: no format anywhere. Replaces every bl MCP_FormatDevice
- * (0x050160d8) of the recovery thread's resume (slc01, mlc01, slccmpt01; the
- * ramdisk one at 0x0510f65e stays) and of MCP_DR_SystemUpdateFromMedia
- * (slccmpt, slc, mlc). A volume without a valid file system then fails at the
- * mount, the same way as a missing MLC, and nothing is formatted.
+ * Blocked formats: each bl MCP_FormatDevice (0x050160d8) listed here is
+ * replaced by a no-op that returns 0, so the volume is never formatted (a
+ * volume without a valid file system then fails at the mount, like a missing
+ * one). The ramdisk format of resume (0x0510f65e) is never blocked.
+ *  - SLC (slc01): always blocked, unless built with SLCFORMAT=1. Formatting the
+ *    SLC destroys everything on it (isfshax, scfm.img, tickets, config).
+ *  - MLC and SLCCMPT: blocked only in the install-only build; the full build
+ *    lets them format when they have no valid file system.
  */
-static const uintptr_t format_calls[] = {
-    0x0510f59e, 0x0510f5b8, 0x0510f5ce,     /* resume: slc01, mlc01, slccmpt01 */
-    0x0510ec3a, 0x0510ecd6, 0x0510ed98,     /* DR update: slccmpt, slc, mlc */
+static const struct { uintptr_t addr; int slc; } format_calls[] = {
+    { 0x0510f59e, 1 },      /* resume: /dev/slc01 */
+    { 0x0510f5b8, 0 },      /* resume: /dev/mlc01 */
+    { 0x0510f5ce, 0 },      /* resume: /dev/slccmpt01 */
+    { 0x0510ec3a, 0 },      /* DR update: slccmpt */
+    { 0x0510ecd6, 1 },      /* DR update: slc (only with wipeSlc) */
+    { 0x0510ed98, 0 },      /* DR update: mlc */
 };
 
 static int recupd_no_format(const char *dev, const char *fs, int force, int r3,
                             int (*org)(const char *, const char *, int))
 {
     (void)r3; (void)org;
-    debug_printf("drsetup: install only, not formatting %s (%s, force %d)\n",
-                 dev, fs, force);
+    debug_printf("drsetup: format blocked: %s (%s, force %d)\n", dev, fs, force);
     return 0;
 }
+
+static void block_formats(void)
+{
+    for (unsigned i = 0; i < sizeof(format_calls) / sizeof(format_calls[0]); i++) {
+#ifndef RECUPD_INSTALL_ONLY
+        if (!format_calls[i].slc)
+            continue;               /* full build: MLC/SLCCMPT may format */
 #endif
+#ifdef RECUPD_ALLOW_SLC_FORMAT
+        if (format_calls[i].slc)
+            continue;
+#endif
+        int blx = 0;
+        if (thumb_bl_target(format_calls[i].addr, &blx) == 0x050160d8 && !blx)
+            trampoline_t_blreplace(format_calls[i].addr, recupd_no_format);
+        else
+            debug_printf("drsetup: %08X is not bl MCP_FormatDevice\n", format_calls[i].addr);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* kernel-time patches                                                 */
@@ -623,15 +793,8 @@ void kern_main(void)
         U32_PATCH_K(ADDR_MCP_GETSECLEVEL, 0x200a4770);
 #endif
 
-#ifdef RECUPD_INSTALL_ONLY
-    for (unsigned i = 0; i < sizeof(format_calls) / sizeof(format_calls[0]); i++) {
-        int blx = 0;
-        if (thumb_bl_target(format_calls[i], &blx) == 0x050160d8 && !blx)
-            trampoline_t_blreplace(format_calls[i], recupd_no_format);
-        else
-            debug_printf("drsetup: %08X is not bl MCP_FormatDevice\n", format_calls[i]);
-    }
-#elif !defined(RECUPD_FORCE_FORMAT)
+    block_formats();
+#if !defined(RECUPD_INSTALL_ONLY) && !defined(RECUPD_FORCE_FORMAT)
     /* make the recovery reinstall's formats conditional (force=false) */
     if (expect16(ADDR_FMT_SLCCMPT, ORIG_FMT_FORCE))
         patch16_k(ADDR_FMT_SLCCMPT, 0x2200);   /* movs r2,#0 */

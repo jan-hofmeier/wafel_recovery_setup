@@ -43,6 +43,12 @@ CFLAGS			+=	$(INCLUDE) -D_GNU_SOURCE -DCAN_HAZ_IRQ -fno-builtin-printf -Wno-nonn
 ifeq ($(INSTALLONLY),1)
 CFLAGS			+=	-DRECUPD_INSTALL_ONLY
 endif
+ifeq ($(SLCFORMAT),1)
+CFLAGS			+=	-DRECUPD_ALLOW_SLC_FORMAT
+endif
+ifeq ($(DELTEST),1)
+CFLAGS			+=	-DRECUPD_DELETE_TEST
+endif
 ifeq ($(REGIONTEST),1)
 CFLAGS			+=	-DRECUPD_REGION_TEST
 endif
