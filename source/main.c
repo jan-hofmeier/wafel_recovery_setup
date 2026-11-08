@@ -23,7 +23,6 @@
 #include <wafel/trampoline.h>
 
 #include "config.h"
-#include "patch16.h"
 #include "display.h"
 #include "slc.h"
 
@@ -84,9 +83,9 @@ static void patch_formats(void)
 
 #if !defined(DRSETUP_INSTALL_ONLY) && !defined(DRSETUP_FORCE_FORMAT)
     /* the DR update's formats only when the volume has no valid file system */
-    patch16_k(ADDR_FMT_SLCCMPT_FORCE, 0x2200);              /* movs r2,#0 */
-    patch16_k(ADDR_FMT_MLC_FORCE, 0x2200);
-    patch16_k(ADDR_FMT_SLC_FORCE, 0x2200);
+    ASM_T_PATCH_K(ADDR_FMT_SLCCMPT_FORCE, "movs r2, #0\n");
+    ASM_T_PATCH_K(ADDR_FMT_MLC_FORCE, "movs r2, #0\n");
+    ASM_T_PATCH_K(ADDR_FMT_SLC_FORCE, "movs r2, #0\n");
 #endif
 }
 
@@ -120,8 +119,9 @@ void kern_main(void)
     U32_PATCH_K(ADDR_BOOTTITLE_CHK, 0x200046c0);
 #endif
 
-    /* never delete tickets: b 0x0510f0c0, past the ticket wipe */
-    patch16_k(ADDR_TICKET_SKIP, 0xe0ba);
+    /* never delete tickets: b 0x0510f0c0, past the ticket wipe (as .short:
+     * an assembled "b" would be relative to the plugin, not to IOSU) */
+    ASM_T_PATCH_K(ADDR_TICKET_SKIP, ".short 0xe0ba\n");
 
     patch_formats();
     slc_kern_patches();

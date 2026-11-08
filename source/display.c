@@ -17,12 +17,12 @@
 #include <wafel/types.h>
 #include <wafel/utils.h>
 #include <wafel/dynamic.h>
+#include <wafel/patch.h>
 #include <wafel/trampoline.h>
 #include <wafel/ios/svc.h>
 #include <wafel/ios/thread.h>
 
 #include "mcp.h"
-#include "patch16.h"
 #include "install.h"
 #include "display.h"
 
@@ -87,7 +87,7 @@ void display_kern_patches(void)
     if ((en & 1) && surf >= 0x14000000 && surf + 1280 * 720 * 4 <= 0x1d000000)
         tv_surface = surf;
 
-    patch16_k(ADDR_DC_INIT_ID, 0x2300);                     /* movs r3,#0: 1080p */
+    ASM_T_PATCH_K(ADDR_DC_INIT_ID, "movs r3, #0\n");        /* DC_INIT id 0: 1080p */
     trampoline_t_blreplace(ADDR_INITMENU_CALL, drsetup_initmenu);
     trampoline_t_blreplace(ADDR_SHOWMENU_CALL, drsetup_showmenu);
 }

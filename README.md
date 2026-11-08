@@ -165,7 +165,6 @@ Test variants (run `make clean` before switching builds):
 | `source/slc.c` | `cafe.xml` delete, `system.xml`/`cert.sys` repair, region fix + sys_prod hook, DELTEST |
 | `source/log.c` | FSA handle (`MCP_fsaInit(NULL)`), SD log, messages on the screen |
 | `source/mcp.h` | MCP addresses and function pointers |
-| `source/patch16.h` | halfword patch helper (2-byte Thumb patches; see `docs/stroopwafel_plugin_api.md`) |
 
 ## How it works (patch map)
 
