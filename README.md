@@ -23,11 +23,14 @@ rollback, not one-title-at-a-time `MCP_Install`.
    unformatted), initialises ES/install, and draws the recovery screen on the TV.
 3. A worker thread then mounts the FAT SD at `/vol/sdcard` and, if
    `/vol/sdcard/wafel_install` exists, calls `MCP_DR_SystemUpdateFromMedia` on it.
-   Before that it sets `initial_launch` to 0 in
-   `/vol/system_slc/proc/prefs/cafe.xml`, so the next boot runs the initial setup.
+   Before that it deletes `/vol/system_slc/proc/prefs/cafe.xml`, so the next
+   boot runs the initial setup (see "Initial setup").
    MCP prints "Updating from …", a progress bar ("Updating system, please
    wait...") and the success/failure line on the TV.
-4. On success the plugin deletes itself from the SD so the next boot is normal.
+4. After a successful install, just before MCP reloads `sys_prod.xml`, the
+   plugin sets `product_area`/`game_region` to the region of the Wii U Menu the
+   install made the coldboot title (see "Region").
+5. On success the plugin deletes itself from the SD so the next boot is normal.
    MCP powers the console off right after the success line.
 
 ## SD layout
@@ -87,9 +90,14 @@ STROOPWAFEL_ROOT=/home/jan/wiiu/stroopwafel DEVKITARM=/opt/devkitpro/devkitARM m
 
 Produces `5recupd.ipx`. Copy it to `sd:/wiiu/ios_plugins/`.
 
-`make NOINSTALL=1` builds a test variant: it boots into recovery, shows the
-screen and resets `initial_launch`, but stops before the reinstall (orange LED).
-It does not delete itself. Run `make clean` before switching between the two.
+Test variants (run `make clean` before switching builds):
+
+- `make NOINSTALL=1`: boots into recovery, shows the screen and deletes
+  `cafe.xml`, but stops before the reinstall (orange LED) and prints
+  "TEST BUILD (NOINSTALL)" on the recovery screen. It does **not** delete itself,
+  so every boot goes back into recovery.
+- `make REGIONTEST=1`: sets sys_prod's region to 2 (USA) before the install, so
+  the region fix afterwards has to write it back. Otherwise a normal run.
 
 ## How it works (patch map)
 
@@ -107,6 +115,7 @@ guarded by an `expect` check of the original bytes.
 | 0x0510eaee | `movs r0,#0; nop` | skip the full-system-package check (omitted with `RECUPD_REQUIRE_FULL_SYSTEM`) |
 | 0x05059090 | `movs r0,#0xa; bx lr` | MCP `IOS_GetSecurityLevel` returns Test, so the update engine doesn't skip same-version titles (omitted with `RECUPD_KEEP_NORMAL_LEVEL`) |
 | bl @0x0510f88a | `trampoline_t_blreplace` | `bl MCP_ShowMenu` in the recovery thread: run it, log the menu surface, then start the worker |
+| bl @0x0510f04c | `trampoline_t_blreplace` | `bl MCP_LoadSysProdXML` after a successful `MCP_SystemUpdate` (step 0x13): fix the region in `sys_prod.xml`, then run the original load (see "Region") |
 | bl @0x051003fe | `trampoline_t_blreplace` (found by scanning `MCP_ShowMenu`) | `bl MCP_InitMenu`: replace DC_CONFIG's framebuffer with the surface the TV scans out (read in `kern_main`), see "Display" |
 
 The worker calls `MCP_DR_SystemUpdateFromMedia("/vol/sdcard/wafel_install", 0)`
@@ -138,10 +147,30 @@ Tested on the user's retail console with `00core`, `4usbmlc`, `5debug`, `5isfsha
      `-1`, so `MCP_FSDelClient(-1)` in stop-ES (`0x0500fe28`) fails.
    - Normal boot uses the same 15 s value (`0x05027de0`), but it doesn't wait
      inside the PM resume.
-   - Future USB-MLC support needs its own wait (the HDD can take a while to
-     spin up and the USB services start late): let resume continue past the
-     MLC wait and catch up the MLC-dependent steps from the worker once
-     `/dev/mlc01` appears.
+   - **Fix, implemented in `wafel_usb_mlc` (2026-11-08, not tested on
+     hardware yet):** a second hook next to its normal-boot
+     `mcp_mlc_wait_hook`, on the recovery resume's `bl wait_for_dev("/dev/mlc01")`
+     at `0x0510f56e` (`f707fbb3`). It brings UMS up before the wait instead of
+     after it:
+     1. mount `/vol/system_slc` (recovery hasn't yet; `MCP_IVS_stuff` may read
+        `security/ivs.bin`), call `MCP_IVS_stuff` (`0x0501c238`), unmount again
+        with `MCP_UnmountFS` (`0x05015b20`, flags `0x80000000`, as recovery does);
+     2. resume `/dev/usbproc2` and `/dev/ums` early (`resume_process`, same PM
+        entries as normal boot);
+     3. wait for `/dev/mlc01` in 1.5 s steps, capped at 5 minutes, so a missing
+        drive ends on the recovery screen.
+     If the IVS can't be set, the USB MLC isn't brought up: in recovery the
+     `/dev/mcp` ioctl 0x7e answer is a fixed default IVS, and formatting or
+     installing with that key would leave a drive normal boot can't read.
+     `MCP_IVS_stuff`'s failure path calls `IVS_WriteDeviceId` (SEEPROM word
+     `0x58`, the IVS seed) when the security level isn't Normal, which the
+     recovery plugin's level patch makes reachable; `wafel_usb_mlc`'s
+     `bsp_eeprom_write_hook` drops writes to words `0x58`–`0x5F`.
+     Also fixed there: `MCP_MountWithSubdir` was declared without the Thumb bit
+     (only used in commented-out code before).
+     The other `wait_for_dev` calls in the DR update (`0x0510ed10`, `0x0510ed82`)
+     run after UMS is up. `wafel_usb_mlc`'s UMS-suspend hook (`0x050283aa`) is in
+     the normal boot thread, so the DR update's MLC unmount doesn't suspend UMS.
 4. **Internal MLC: success.** `4usbmlc.ipx` removed, internal 64 GB MLC.
    - The MLC came up `raw` (no valid WFS), so recovery resume's own
      *conditional* format (`MCP: Formatting Device mlc to wfs`, 0.87 s)
@@ -160,6 +189,15 @@ Tested on the user's retail console with `00core`, `4usbmlc`, `5debug`, `5isfsha
    format): menu at once, text and progress bar during the install, `System update
    was successful` after 4 min 42 s, self-delete OK. Initial setup starts on the
    next boot.
+6. **Region test** (`REGIONTEST=1`, after the user had erased the MLC): see
+   "Region". Passed.
+7. An earlier report "doesn't delete itself and only boots into recovery" was the
+   NOINSTALL test build left on the SD (11088 bytes vs. the release), not a bug.
+8. **Error handling** (2026-11-08): MLC disconnected → step 8 failure as in the
+   table above, all plugin lines readable on the TV, nothing changed.
+   REGIONTEST with the in-place write: 2 written, 4 written back, sys_prod load
+   0, success. Release run: "already matches", load 0, plugin removed after the
+   power-off line.
 
 ## Display: why the menu was invisible, and the fix
 
@@ -205,11 +243,14 @@ Hardware, 2026-11-08:
   then `FS_VOLSTATE_FATAL`.
 - `wafel_setup_mlc` sets `cafe.initial_launch = 0` through `/dev/usr_cfg`
   (MCP's `UC_WriteSysConfig` `0x05044a8c`). In recovery mode `/dev/usr_cfg`
-  isn't running (open/read/write return `-6`), so the worker edits `cafe.xml`
-  directly: the one-digit value is overwritten in place (`r+`, same length, the
-  file is never truncated), then `/vol/system_slc` is flushed. This happens
-  **before** the reinstall, because MCP powers off right after a successful one.
-- With `initial_launch = 0` the next boot started the initial setup (confirmed).
+  isn't running (open/read/write return `-6`).
+- First fix: edit `initial_launch` in `cafe.xml` in place (2 → 0); the next boot
+  started the initial setup.
+- **Current behaviour:** the worker **deletes** `cafe.xml` (then flushes the
+  SLC) before the reinstall; MCP powers off right after a successful one, so it
+  can't come after. See below for why; "not found" counts as fine. Release run
+  2026-11-08: the file (recreated by the previous setup boot) was deleted,
+  update successful, plugin removed.
 - `cafe.xml` as found (661 bytes): `version 5`, `language 1`, `cntry_reg 78`,
   `eula_agree 0`, `eula_version 101`, `initial_launch 2`, `eco 0`, `fast_boot 0`.
   `/vol/system_slc/proc/prefs/` also holds `nn.xml`, `cos.xml`, `parent.xml`,
@@ -217,6 +258,86 @@ Hardware, 2026-11-08:
   `/vol/system_slc/config/` only `eco.xml`, `rtc.xml`, `sys_prod.xml`, `system.xml`.
 - Region (`wafel_setup_mlc`'s `fix_region`) wasn't needed here: the Menu matched
   the console's region.
+
+### How stock does it, and deleting `cafe.xml` instead
+
+- Stock recovery never resets `initial_launch`. `MCP_DR_SystemUpdateFromMedia`
+  writes a default `system.xml` (`MCP_WriteDefaultSystemConfig(1)`
+  `0x050049c0`) only with `wipeSlc != 0` (devkit `reflash`), which force-formats
+  the SLC first, so `/vol/system_slc/proc/prefs/` is gone too. The factory SD
+  update uses `wipeSlc = 0`, like this plugin; a factory console's prefs were
+  simply never set.
+- A missing `cafe.xml` is recreated by the SCI library's `SCIInitCafeSettings`
+  (copy in IOS-ACP at `0xe0043c34`, also in NET, NIM-BOSS, FPD): when reading the
+  9 `cafe.*` items fails it deletes the group and writes it with `version 5`
+  and **everything else 0** (defaults at `0xe010c840`): language, cntry_reg,
+  eula_agree, eula_version, initial_launch, eco, fast_boot.
+- Hardware, 2026-11-08 (`make NOINSTALL=1 CAFEDEL=1`: back up `cafe.xml` to
+  `/vol/sdcard/cafe.xml.bak`, then delete it): the next normal boot went into
+  the initial setup, asking for language etc. No SCI/FS errors in the log.
+
+
+## Region
+
+Boot Recovery has no region step: `MCP_DR_SystemUpdateFromMedia` only reads
+`sys_prod.xml` (and on ATFS media picks `update.inf.<REG>` from `product_area`).
+The native writer, `/dev/mcp` ioctlv 0x41 `SetSysProdSettings`, is behind
+`IOS_CheckDebugMode()` (`0x05024648`, OTP), closed on retail even in recovery;
+`wafel_setup_mlc` NOPs it plus two XML access checks.
+
+The plugin uses the same rule as `wafel_setup_mlc`'s `fix_region`, at the point
+the user suggested: the end of the recovery update.
+
+- Installing a title with app type `0x90000001` (system menu) calls
+  `MCP_SysCfg_SetDefaultTitle` in the install path (`mcpdr_install.c`), and
+  `MCP_SystemUpdate` sets one if none is set. So after the install the coldboot
+  title is the package's Wii U Menu.
+- The hook replaces `bl MCP_LoadSysProdXML` at `0x0510f04c` (original
+  `f6f2fdbc`). It only runs after a successful install, before the success line
+  and before power transitions are re-enabled, so it doesn't race the power-off.
+  It runs in the worker thread (the worker calls the DR function).
+- It reads the coldboot title with `MCP_SysCfg_GetDefaultTitle`
+  (`0x05004714`, Thumb). If it is `00050010100400x0`, the region is `1 << x`
+  (1 JPN, 2 USA, 4 EUR, ...). If `product_area` or `game_region` differ, it
+  rewrites `/vol/system_slc/config/sys_prod.xml` with both values replaced
+  (decimal text, other fields untouched), flushes the SLC, then calls the
+  original `MCP_LoadSysProdXML`, which loads the fixed file.
+- The write is **in place** (`r+`, same length, the file is never truncated),
+  so a failed write or power loss can't leave `sys_prod.xml` empty. The FSA
+  client has no rename, so there is no temp-file swap. A region with a different
+  digit count than the old one (16/32/64 for CHN/KOR/TWN vs. 1/2/4/8) is
+  refused with a message, sys_prod stays unchanged.
+- `wafel_setup_mlc`'s title check
+  `coldbootTitle & 0xFFFFFFFFFFFFF0FF != 0005001010040000UL` never fails
+  (`!=` binds tighter than `&`); the plugin's version uses parentheses.
+- sys_prod.xml on the test console: 860 bytes, `product_area 4`,
+  `game_region 4`, `ntsc_pal PAL`, `5ghz_country_code EU`, model `WUP-101(03)`.
+- Hardware, 2026-11-08 (`REGIONTEST=1`): region set to 2 before the install, hook
+  read coldboot title `0005001010040200`, rewrote sys_prod to 4 (860 bytes),
+  install reported success, plugin deleted itself.
+
+## What happens on errors
+
+Every plugin message goes to `/vol/sdcard/wafel_recupd.log` **and** the
+recovery screen's text area (`DrCon_Printf` `0x05110de4`), prefixed
+`wafel_recupd:`. The plugin deletes itself only after a full success; in every
+other case it stays on the SD, so each boot goes back into recovery and retries
+until the update succeeds or the `.ipx` is removed.
+
+| Case | What happens | Console changed? |
+|---|---|---|
+| No `wafel_install` folder | "no wafel_install folder on SD, nothing installed", orange LED | no |
+| MLC missing / doesn't attach (tested: MLC disconnected) | recovery's 15 s wait fails, resume skips mounts and ES; "FAILED to open cafe.xml"; MCP fails at step 8 "failed to stop ES"; "system update FAILED at step 0x08", "plugin stays on the SD: the next boot retries", red LED | no (step 8 is before any format) |
+| Install fails (`MCP_SystemUpdate` error) | MCP "System update failed, err N", plugin "FAILED at step 0x12", red LED; console stays on the screen (no power-off) | yes: conditional MLC format, `security/version` deleted, `cafe.xml` deleted, titles installed so far (rollback not checked) |
+| Region fix fails (not a Menu, can't parse, length differs, write fails) | message on screen; the update still finishes with the old region | only on a successful write |
+| Final `MCP_LoadSysProdXML` fails | MCP "System update failed" with the step **still 0x13** (MCP sets it before the load). The plugin's hook records the load result, so the worker reports "sys_prod.xml load FAILED after the install" instead of success and stays on the SD | install done |
+| Success | the plugin deletes itself **first**, then "system update was successful, plugin removed". MCP powers off right after its success line; on hardware the power-off log line came before the plugin's messages, but the delete still went through | yes |
+
+Cosmetic, left as is: "Updating from /vol/sdcard/wafel_install//..." The
+second slash is stock: `MCP_DR_SystemUpdateFromMedia` builds the path with
+`snprintf(pkg, "%s/%s", root, "/")` (`0x0510eae8`), so every root ends in
+`//`, the factory one (`/vol/storage_sdcard01/update`) too. A hook on that call
+worked on hardware but was dropped to keep MCP's code stock.
 
 ## Static analysis of the recovery code (MCP decomp, 2026-11-08)
 

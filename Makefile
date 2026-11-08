@@ -36,6 +36,9 @@ CFLAGS			:=	-g -std=c11 -Os \
 
 CFLAGS			+=	$(INCLUDE) -D_GNU_SOURCE -DCAN_HAZ_IRQ -fno-builtin-printf -Wno-nonnull -Werror=implicit
 
+ifeq ($(REGIONTEST),1)
+CFLAGS			+=	-DRECUPD_REGION_TEST
+endif
 ifeq ($(NOINSTALL),1)
 CFLAGS			+=	-DRECUPD_NO_INSTALL
 endif

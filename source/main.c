@@ -69,6 +69,10 @@ typedef int (*wait_for_dev_fn)(const char *dev, u32 timeout_us);
 static const wait_for_dev_fn wait_for_dev =
     (wait_for_dev_fn)(0x05016cd8 | 1);
 
+/* MCP on-screen console printf (Thumb), mcpdr_misc.c */
+typedef int (*drcon_printf_fn)(const char *fmt, ...);
+#define DrCon_Printf ((drcon_printf_fn)(0x05110de4 | 1))
+
 /* MCP menu state set by MCP_InitMenu (0x051114c8) */
 #define MCP_MENU ((volatile u32 *)0x050bc520)
 
@@ -138,68 +142,180 @@ static void recupd_log(int fsa, const char *msg)
     }
 }
 
+/* log to the SD and print on the recovery screen (MCP's text console) */
+static void recupd_say(int fsa, const char *msg)
+{
+    debug_printf("wafel_recupd: %s\n", msg);
+    DrCon_Printf("wafel_recupd: %s\n", msg);
+    recupd_log(fsa, msg);
+}
+
 /*
- * cafe.initial_launch = 0 so the next boot runs the initial setup. Without it
- * the SLC still says setup was done (value 2), the Wii U Menu starts on the
- * freshly formatted MLC, its first save access fails (FLUSH_QUOTA NOT_FOUND on
+ * Initial setup on the next boot. Without it the SLC still says setup was done
+ * (cafe.initial_launch = 2), the Wii U Menu starts on the freshly installed
+ * MLC, its first save access fails (FLUSH_QUOTA NOT_FOUND on
  * /vol/storage_mlc01/usr/save/00050010/1004a200/..., FS_VOLSTATE_FATAL) and it
  * hangs at the Wii U logo (hardware, 2026-11-08).
- * /dev/usr_cfg isn't running in recovery mode (open/read/write give -6), so
- * edit the backing file /vol/system_slc/proc/prefs/cafe.xml directly: the
- * one-digit value is replaced in place (same length, opened "r+"), then the
- * SLC is flushed.
+ * Stock recovery never resets it: only a full SLC wipe (devkit "reflash")
+ * removes /vol/system_slc/proc/prefs. Deleting cafe.xml gets the same state:
+ * the SCI library (SCIInitCafeSettings, e.g. IOS-ACP 0xe0043c34) recreates the
+ * cafe group with version 5 and everything else 0, initial_launch included, and
+ * the initial setup asks for language, country and EULA again (hardware,
+ * 2026-11-08). /dev/usr_cfg isn't running in recovery mode, so the file is
+ * removed through FSA.
  */
 #define CAFE_XML "/vol/system_slc/proc/prefs/cafe.xml"
 
 static void recupd_set_initial_launch(int fsa)
 {
+    int r = FSA_Remove(fsa, CAFE_XML);
+    int f = FSA_FlushVolume(fsa, "/vol/system_slc");
+    debug_printf("wafel_recupd: remove %s: %X, flush %X\n", CAFE_XML, r, f);
+    if (r == 0)
+        recupd_log(fsa, "deleted cafe.xml (initial setup on next boot)");
+    else if (r == (int)0xFFFCFFE9)      /* FSA "not found": already gone */
+        recupd_log(fsa, "cafe.xml already absent (initial setup on next boot)");
+    else
+        recupd_say(fsa, "FAILED to delete cafe.xml, initial setup may not start");
+}
+
+/*
+ * Region fix, run inside MCP_DR_SystemUpdateFromMedia after a successful
+ * install: the "bl MCP_LoadSysProdXML" at 0x0510f04c (step 0x13, before the
+ * success line and before power transitions are re-enabled) is replaced.
+ * Installing the system menu (app type 0x90000001) sets system.xml
+ * default_title_id (MCP_SysCfg_SetDefaultTitle in the install path), so the
+ * coldboot title now is the package's Wii U Menu. Same rule as
+ * wafel_setup_mlc's fix_region: title 00050010100400x0 -> region bit 1 << x,
+ * written to product_area and game_region in sys_prod.xml (decimal text) when
+ * they differ. Then the original MCP_LoadSysProdXML loads the fixed file.
+ */
+#define ADDR_LOAD_SYSPROD_CALL  0x0510f04c   /* bl MCP_LoadSysProdXML (0x05001bc8) */
+#define ORIG_LOAD_SYSPROD_CALL  0xf6f2fdbc
+#define SYS_PROD_XML            "/vol/system_slc/config/sys_prod.xml"
+typedef void (*get_default_title_fn)(u64 *title, u64 *os);
+#define MCP_SysCfg_GetDefaultTitle ((get_default_title_fn)(0x05004714 | 1))
+
+static int g_fsa = -1;      /* worker's FSA handle, used by the region hook */
+
+/* find "<tag ...>" and return the offset of its text value, or -1 */
+static int xml_value(const char *b, int n, const char *tag)
+{
+    for (int i = 0; i < n; i++) {
+        int k = 0;
+        while (tag[k] && i + k < n && b[i + k] == tag[k]) k++;
+        if (tag[k] || i + k >= n || (b[i + k] != ' ' && b[i + k] != '>'))
+            continue;
+        int j = i + k;
+        while (j < n && b[j] != '>') j++;
+        return j + 1 < n ? j + 1 : -1;
+    }
+    return -1;
+}
+
+static u32 xml_u32(const char *b, int n, int pos, int *len)
+{
+    u32 v = 0;
+    int l = 0;
+    while (pos + l < n && b[pos + l] >= '0' && b[pos + l] <= '9')
+        v = v * 10 + (b[pos + l++] - '0');
+    *len = l;
+    return v;
+}
+
+static int put_u32(char *d, u32 v)
+{
+    char t[10];
+    int n = 0;
+    do { t[n++] = '0' + v % 10; v /= 10; } while (v);
+    for (int i = 0; i < n; i++) d[i] = t[n - 1 - i];
+    return n;
+}
+
+/* set product_area and game_region in sys_prod.xml to region (in place) */
+static void sysprod_set_region(int fsa, u32 region)
+{
     int h = -1;
-    int r = FSA_OpenFile(fsa, CAFE_XML, "r+", &h);
-    if (r || h < 0) {
-        debug_printf("wafel_recupd: open %s: %X\n", CAFE_XML, r);
-        recupd_log(fsa, "FAILED to open cafe.xml, initial setup not reset");
+    if (FSA_OpenFile(fsa, SYS_PROD_XML, "r", &h) || h < 0) {
+        recupd_say(fsa, "region: FAILED to open sys_prod.xml");
         return;
     }
-    char *buf = (char *)iosAllocAligned(0xCAFF, 0x2000, 0x40);
-    const char *msg = "FAILED to set initial_launch in cafe.xml";
-    if (buf) {
-        int n = FSA_ReadFile(fsa, buf, 1, 0x1fff, h, 0);
-        int pos = -1;
-        if (n > 0) {
-            buf[n] = 0;
-            const char *tag = "<initial_launch";
-            for (int i = 0; i < n && pos < 0; i++) {
-                int k = 0;
-                while (tag[k] && buf[i + k] == tag[k]) k++;
-                if (!tag[k]) {
-                    int j = i + k;
-                    while (j < n && buf[j] != '>') j++;
-                    if (j + 2 < n && buf[j + 2] == '<')
-                        pos = j + 1;            /* single-digit value */
-                }
-            }
-        }
-        if (pos < 0) {
-            debug_printf("wafel_recupd: initial_launch not found in cafe.xml (%d bytes)\n", n);
-        } else if (buf[pos] == '0') {
-            debug_printf("wafel_recupd: cafe.xml initial_launch already 0\n");
-            msg = "cafe.xml initial_launch already 0";
-        } else {
-            debug_printf("wafel_recupd: cafe.xml initial_launch %c -> 0\n", buf[pos]);
-            buf[pos] = '0';
-            int w = -1;
-            if (FSA_SetPosFile(fsa, h, 0) == 0)
-                w = FSA_WriteFile(fsa, buf, 1, n, h, 0);
-            debug_printf("wafel_recupd: rewrote cafe.xml: %d of %d bytes\n", w, n);
-            if (w == n)
-                msg = "set cafe.xml initial_launch = 0 (initial setup on next boot)";
-        }
-        iosFree(0xCAFF, buf);
-    }
+    char *in = (char *)iosAllocAligned(0xCAFF, 0x1000, 0x40);
+    char *out = (char *)iosAllocAligned(0xCAFF, 0x1000, 0x40);
+    int n = (in && out) ? FSA_ReadFile(fsa, in, 1, 0xfc0, h, 0) : -1;
     FSA_CloseFile(fsa, h);
-    r = FSA_FlushVolume(fsa, "/vol/system_slc");
-    debug_printf("wafel_recupd: flush /vol/system_slc %X\n", r);
-    recupd_log(fsa, msg);
+    int pa = n > 0 ? xml_value(in, n, "<product_area") : -1;
+    int gr = n > 0 ? xml_value(in, n, "<game_region") : -1;
+    int la = 0, lg = 0;
+    u32 va = pa >= 0 ? xml_u32(in, n, pa, &la) : 0;
+    u32 vg = gr >= 0 ? xml_u32(in, n, gr, &lg) : 0;
+    debug_printf("wafel_recupd: sys_prod product_area %u game_region %u, wanted %u\n",
+                 va, vg, region);
+    if (pa < 0 || gr < 0 || !la || !lg || n >= 0xfc0) {
+        recupd_say(fsa, "region: FAILED to parse sys_prod.xml, region unchanged");
+    } else if (va == region && vg == region) {
+        recupd_say(fsa, "region: sys_prod already matches the Wii U Menu");
+    } else if (put_u32(out, region) != la || put_u32(out, region) != lg) {
+        /* No rename in the FSA client, so no temp file + swap; truncating the
+         * file to rewrite it could leave sys_prod.xml empty on a failed write
+         * or power loss. Only same-length values are changed. */
+        recupd_say(fsa, "region: new value has a different length, sys_prod NOT changed");
+    } else {
+        /* overwrite both digits in place ("r+", same length, never truncated) */
+        put_u32(in + pa, region);
+        put_u32(in + gr, region);
+        int w = -1;
+        h = -1;
+        if (FSA_OpenFile(fsa, SYS_PROD_XML, "r+", &h) == 0 && h >= 0) {
+            if (FSA_SetPosFile(fsa, h, 0) == 0)
+                w = FSA_WriteFile(fsa, in, 1, n, h, 0);
+            FSA_CloseFile(fsa, h);
+        }
+        int f = FSA_FlushVolume(fsa, "/vol/system_slc");
+        debug_printf("wafel_recupd: wrote sys_prod.xml region %u: %d of %d bytes, flush %X\n",
+                     region, w, n, f);
+        recupd_say(fsa, w == n ? "region: sys_prod product_area/game_region set to the Wii U Menu's region"
+                               : "region: FAILED to write sys_prod.xml");
+    }
+    if (in) iosFree(0xCAFF, in);
+    if (out) iosFree(0xCAFF, out);
+}
+
+static void recupd_fix_region(int fsa)
+{
+    u64 title = 0, os = 0;
+    MCP_SysCfg_GetDefaultTitle(&title, &os);
+    debug_printf("wafel_recupd: coldboot title %08X%08X\n", (u32)(title >> 32), (u32)title);
+    /* (wafel_setup_mlc's version of this check can't fail: "&" binds weaker than "!=") */
+    if ((title & 0xFFFFFFFFFFFFF0FFull) != 0x0005001010040000ull) {
+        recupd_say(fsa, "region: coldboot title is not a Wii U Menu, region unchanged");
+        return;
+    }
+    u32 idx = (title >> 8) & 0xf;
+    if (idx >= 7) {
+        recupd_say(fsa, "region: unknown Wii U Menu region, region unchanged");
+        return;
+    }
+    sysprod_set_region(fsa, 1u << idx);
+}
+
+/*
+ * MCP sets the step to 0x13 BEFORE this MCP_LoadSysProdXML call, and a failing
+ * load makes the update fail with the step still 0x13. So the worker also needs
+ * this call's result: 1 = not reached, else the MCP_LoadSysProdXML return value.
+ */
+static int g_sysprod_hooked;
+static volatile int g_sysprod_load = 1;
+
+static int recupd_loadsysprod(int r0, int r1, int r2, int r3, int (*org)(void))
+{
+    (void)r0; (void)r1; (void)r2; (void)r3;
+    if (g_fsa >= 0)
+        recupd_fix_region(g_fsa);
+    int ret = org();
+    g_sysprod_load = ret;
+    debug_printf("wafel_recupd: MCP_LoadSysProdXML returned %d\n", ret);
+    return ret;
 }
 
 static u32 recupd_main(void *arg)
@@ -216,6 +332,7 @@ static u32 recupd_main(void *arg)
         fsa = recupd_fsa_open();
         if (fsa < 0) msleep(500);
     }
+    g_fsa = fsa;
     if (fsa < 0) {
         debug_printf("wafel_recupd: FSA_Open failed %d\n", fsa);
         SetNotificationLED(NOTIF_LED_RED | NOTIF_LED_RED_BLINKING);
@@ -230,7 +347,7 @@ static u32 recupd_main(void *arg)
     int dir = -1;
     if (FSA_OpenDir(fsa, RECUPD_INSTALL_DIR, &dir) != 0) {
         debug_printf("wafel_recupd: no %s on SD\n", RECUPD_INSTALL_DIR);
-        recupd_log(fsa, "no wafel_install folder on SD; nothing to do");
+        recupd_say(fsa, "no wafel_install folder on SD, nothing installed");
         SetNotificationLED(NOTIF_LED_ORANGE);
         FSA_Unmount(fsa, RECUPD_SD_MOUNT, 0);
         iosClose(fsa);
@@ -239,9 +356,17 @@ static u32 recupd_main(void *arg)
     FSA_CloseDir(fsa, dir);
     recupd_set_initial_launch(fsa);
 
+#ifdef RECUPD_REGION_TEST
+    /* test build (make REGIONTEST=1): break the region (USA) so the fix after
+     * the install has to write it back */
+    debug_printf("wafel_recupd: REGIONTEST build, setting sys_prod region to 2\n");
+    sysprod_set_region(fsa, 2);
+#endif
+
 #ifdef RECUPD_NO_INSTALL
     /* test build (make NOINSTALL=1): show the recovery screen, install nothing */
     debug_printf("wafel_recupd: NOINSTALL build, not installing\n");
+    DrCon_Printf("wafel_recupd TEST BUILD (NOINSTALL): nothing installed\n");
     SetNotificationLED(NOTIF_LED_ORANGE);
     iosClose(fsa);
     return 0;
@@ -258,12 +383,20 @@ static u32 recupd_main(void *arg)
     MCP_DR_SystemUpdateFromMedia(RECUPD_INSTALL_DIR, RECUPD_WIPE_SLC);
 
     u32 step = MCP_DR_STEP;
-    if (step == MCP_DR_STEP_DONE) {
-        debug_printf("wafel_recupd: success\n");
-        recupd_log(fsa, "system update was successful");
-        /* self-delete so the next boot is a normal boot */
-        FSA_Remove(fsa, RECUPD_IPX_PATH);
+    /* step 0x13 is set before the final sys_prod load; that load must have
+     * worked too (if the hook couldn't be installed, only the step is known) */
+    int ok = step == MCP_DR_STEP_DONE && (!g_sysprod_hooked || g_sysprod_load == 0);
+    if (step == MCP_DR_STEP_DONE && !ok)
+        recupd_say(fsa, "sys_prod.xml load FAILED after the install");
+    if (ok) {
+        /* self-delete FIRST so the next boot is a normal boot: MCP powers off
+         * right after the success line, and on hardware the power-off already
+         * cut into the message that came before the delete */
+        int rm = FSA_Remove(fsa, RECUPD_IPX_PATH);
         FSA_FlushVolume(fsa, RECUPD_SD_MOUNT);
+        debug_printf("wafel_recupd: success, plugin removed %X\n", rm);
+        recupd_say(fsa, rm == 0 ? "system update was successful, plugin removed"
+                                : "system update was successful, FAILED to remove the plugin");
         SetNotificationLED(NOTIF_LED_BLUE);
     } else {
         debug_printf("wafel_recupd: failed at step 0x%X\n", step);
@@ -275,7 +408,8 @@ static u32 recupd_main(void *arg)
         line[n++] = hex[(step >> 4) & 0xf];
         line[n++] = hex[step & 0xf];
         line[n] = 0;
-        recupd_log(fsa, line);
+        recupd_say(fsa, line);
+        recupd_say(fsa, "plugin stays on the SD: the next boot retries");
         SetNotificationLED(NOTIF_LED_RED);
     }
 
@@ -457,6 +591,12 @@ void kern_main(void)
     if (expect32(ADDR_BOOTTITLE_CHK, ORIG_BOOTTITLE_CHK))
         U32_PATCH_K(ADDR_BOOTTITLE_CHK, 0x200046c0);          /* movs r0,#0;nop */
 #endif
+
+    /* fix the region in sys_prod after the install, before MCP reloads it */
+    if (expect32(ADDR_LOAD_SYSPROD_CALL, ORIG_LOAD_SYSPROD_CALL)) {
+        trampoline_t_blreplace(ADDR_LOAD_SYSPROD_CALL, recupd_loadsysprod);
+        g_sysprod_hooked = 1;
+    }
 
     /* draw the recovery screen into the surface the TV really scans out */
     patch_menu_surface();
