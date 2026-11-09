@@ -1,6 +1,6 @@
 /*
  * SLC content the reinstall and the next boot need
- * (IOSU notes: docs/slc_minimum_for_recovery.md).
+ * (docs/technical.md, "SLC repair").
  */
 #include <string.h>
 #include <wafel/types.h>
@@ -234,17 +234,17 @@ void slc_set_region(u32 region)
     drsetup_say(r == 0 ? "region: sys_prod product_area/game_region set to the Wii U Menu's region"
                        : "region: FAILED to write sys_prod.xml");
 #ifdef DRSETUP_REGION_TEST
-    /* the write must keep the other fields: read them back */
-    char serial[12 + 1] = {0};
+    /* the write must keep the other fields: read two back */
+    char model[16 + 1] = {0};
     u32 version = 0;
     area = game = 0;
     UCItem chk[5];
     memcpy(chk, it, sizeof(it));
-    uc_item(&chk[3], "slc:sys_prod.serial_id", 6, 12, serial);
+    uc_item(&chk[3], "slc:sys_prod.model_number", 6, 16, model);
     uc_item(&chk[4], "slc:sys_prod.version", UC_U32, 4, &version);
     r = MCP_Cnfg_Read(UC_PERMS, 5, chk);
-    debug_printf("drsetup: REGIONTEST re-read %d: area %u game %u version %u serial '%s' (errors %d %d %d %d %d)\n",
-                 r, area, game, version, serial, chk[0].error, chk[1].error, chk[2].error,
+    debug_printf("drsetup: REGIONTEST re-read %d: area %u game %u version %u model '%s' (errors %d %d %d %d %d)\n",
+                 r, area, game, version, model, chk[0].error, chk[1].error, chk[2].error,
                  chk[3].error, chk[4].error);
 #endif
 }
