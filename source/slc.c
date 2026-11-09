@@ -2,9 +2,11 @@
  * SLC content the reinstall and the next boot need
  * (IOSU notes: docs/slc_minimum_for_recovery.md).
  */
+#include <string.h>
 #include <wafel/types.h>
 #include <wafel/utils.h>
 #include <wafel/trampoline.h>
+#include <wafel/patch.h>
 #include <wafel/ios/svc.h>
 #include <wafel/services/fsa.h>
 
@@ -165,83 +167,86 @@ void slc_prepare(void)
 /* ------------------------------------------------------------------ */
 /* region (sys_prod.xml)                                               */
 /* ------------------------------------------------------------------ */
-/* find "<tag ...>" and return the offset of its text value, or -1 */
-static int xml_value(const char *b, int n, const char *tag)
-{
-    for (int i = 0; i < n; i++) {
-        int k = 0;
-        while (tag[k] && i + k < n && b[i + k] == tag[k]) k++;
-        if (tag[k] || i + k >= n || (b[i + k] != ' ' && b[i + k] != '>'))
-            continue;
-        int j = i + k;
-        while (j < n && b[j] != '>') j++;
-        return j + 1 < n ? j + 1 : -1;
-    }
-    return -1;
-}
-
-static u32 xml_u32(const char *b, int n, int pos, int *len)
-{
-    u32 v = 0;
-    int l = 0;
-    while (pos + l < n && b[pos + l] >= '0' && b[pos + l] <= '9')
-        v = v * 10 + (b[pos + l++] - '0');
-    *len = l;
-    return v;
-}
-
-static int put_u32(char *d, u32 v)
-{
-    char t[10];
-    int n = 0;
-    do { t[n++] = '0' + v % 10; v /= 10; } while (v);
-    for (int i = 0; i < n; i++) d[i] = t[n - 1 - i];
-    return n;
-}
-
 /*
- * Set product_area and game_region in sys_prod.xml to region. Written in place
- * ("r+", same length, never truncated): the FSA client has no rename for a
- * temp file + swap, and a truncated sys_prod.xml would lose production data.
- * A value with a different number of digits is refused.
+ * sys_prod.xml is changed through MCP's own config client (the UC library,
+ * same code as /dev/usr_cfg), like /dev/mcp ioctlv 0x41 SetSysProdSettings
+ * does. That ioctl isn't reachable here: in Boot Recovery /dev/mcp is the
+ * recovery thread's resource manager, which only knows ioctl 0x7e.
+ * MCP_Cnfg_Write reads the file, merges the given items into its tree
+ * (Cnfg_MergeTree 0x0503c970) and saves the whole tree, so the other
+ * sys_prod fields are kept. The sys_prod nodes are read-only for every
+ * caller; the access checks are patched out in slc_kern_patches (same
+ * patches as wafel_setup_mlc).
  */
+typedef struct UCItem {         /* 0x54 bytes, as coreinit's UCSysConfig */
+    char  name[0x40];
+    u32   access;               /* 0: no access-attribute check on write */
+    u32   type;
+    s32   error;                /* per-item result */
+    u32   size;                 /* must match the node's length attribute */
+    void *data;
+} UCItem;
+_Static_assert(sizeof(UCItem) == 0x54, "UCItem size");
+
+#define UC_U32      3
+#define UC_COMPLEX  8
+#define UC_PERMS    0x777       /* caller permissions MCP uses for sys_prod */
+
+#define MCP_Cnfg_Read  ((int (*)(u32 perms, u32 n, UCItem *items))(0x0503b43c | 1))
+#define MCP_Cnfg_Write ((int (*)(u32 perms, u32 n, UCItem *items))(0x0503b400 | 1))
+
+#define ADDR_CNFG_LEAF_ACCESS  0x0503cc44  /* Cnfg_MergeTree: node not writable -> error */
+#define ADDR_CNFG_ITEM_ACCESS  0x0503cd32  /* Cnfg_MergeTree: item access != node access */
+
+static void uc_item(UCItem *it, const char *name, u32 type, u32 size, void *data)
+{
+    memset(it, 0, sizeof(*it));
+    strncpy(it->name, name, sizeof(it->name) - 1);
+    it->type = type;
+    it->size = size;
+    it->data = data;
+}
+
+/* set product_area and game_region in sys_prod.xml to region */
 void slc_set_region(u32 region)
 {
-    int fsa = drsetup_fsa;
-    char *in = (char *)iosAllocAligned(0xCAFF, 0x1000, 0x40);
-    char digits[10];
-    int n = in ? drsetup_read_file(SYS_PROD_XML, in, 0xfc0) : -1;
-    int pa = n > 0 ? xml_value(in, n, "<product_area") : -1;
-    int gr = n > 0 ? xml_value(in, n, "<game_region") : -1;
-    int la = 0, lg = 0;
-    u32 va = pa >= 0 ? xml_u32(in, n, pa, &la) : 0;
-    u32 vg = gr >= 0 ? xml_u32(in, n, gr, &lg) : 0;
-    debug_printf("drsetup: sys_prod product_area %u game_region %u, wanted %u\n",
-                 va, vg, region);
-    if (n <= 0) {
-        drsetup_say("region: FAILED to read sys_prod.xml");
-    } else if (pa < 0 || gr < 0 || !la || !lg || n >= 0xfc0) {
-        drsetup_say("region: FAILED to parse sys_prod.xml, region unchanged");
-    } else if (va == region && vg == region) {
-        drsetup_say("region: sys_prod already matches the Wii U Menu");
-    } else if (put_u32(digits, region) != la || la != lg) {
-        drsetup_say("region: new value has a different length, sys_prod NOT changed");
-    } else {
-        put_u32(in + pa, region);
-        put_u32(in + gr, region);
-        int w = -1, h = -1;
-        if (FSA_OpenFile(fsa, SYS_PROD_XML, "r+", &h) == 0 && h >= 0) {
-            if (FSA_SetPosFile(fsa, h, 0) == 0)
-                w = FSA_WriteFile(fsa, in, 1, n, h, 0);
-            FSA_CloseFile(fsa, h);
-        }
-        int f = FSA_FlushVolume(fsa, "/vol/system_slc");
-        debug_printf("drsetup: wrote sys_prod.xml region %u: %d of %d bytes, flush %X\n",
-                     region, w, n, f);
-        drsetup_say(w == n ? "region: sys_prod product_area/game_region set to the Wii U Menu's region"
-                           : "region: FAILED to write sys_prod.xml");
+    u32 area = 0, game = 0;
+    UCItem it[3];
+    uc_item(&it[0], "slc:sys_prod", UC_COMPLEX, 0, NULL);
+    uc_item(&it[1], "slc:sys_prod.product_area", UC_U32, 4, &area);
+    uc_item(&it[2], "slc:sys_prod.game_region", UC_U32, 4, &game);
+
+    int r = MCP_Cnfg_Read(UC_PERMS, 3, it);
+    debug_printf("drsetup: sys_prod read %d (%d %d %d): product_area %u game_region %u, wanted %u\n",
+                 r, it[0].error, it[1].error, it[2].error, area, game, region);
+    if (r != 0) {
+        drsetup_say("region: FAILED to read sys_prod.xml, region unchanged");
+        return;
     }
-    if (in) iosFree(0xCAFF, in);
+    if (area == region && game == region) {
+        drsetup_say("region: sys_prod already matches the Wii U Menu");
+        return;
+    }
+    area = game = region;
+    r = MCP_Cnfg_Write(UC_PERMS, 3, it);
+    debug_printf("drsetup: sys_prod write region %u: %d (%d %d %d)\n",
+                 region, r, it[0].error, it[1].error, it[2].error);
+    drsetup_say(r == 0 ? "region: sys_prod product_area/game_region set to the Wii U Menu's region"
+                       : "region: FAILED to write sys_prod.xml");
+#ifdef DRSETUP_REGION_TEST
+    /* the write must keep the other fields: read them back */
+    char serial[12 + 1] = {0};
+    u32 version = 0;
+    area = game = 0;
+    UCItem chk[5];
+    memcpy(chk, it, sizeof(it));
+    uc_item(&chk[3], "slc:sys_prod.serial_id", 6, 12, serial);
+    uc_item(&chk[4], "slc:sys_prod.version", UC_U32, 4, &version);
+    r = MCP_Cnfg_Read(UC_PERMS, 5, chk);
+    debug_printf("drsetup: REGIONTEST re-read %d: area %u game %u version %u serial '%s' (errors %d %d %d %d %d)\n",
+                 r, area, game, version, serial, chk[0].error, chk[1].error, chk[2].error,
+                 chk[3].error, chk[4].error);
+#endif
 }
 
 /*
@@ -298,6 +303,11 @@ int slc_sysprod_load_result(void)
 
 void slc_kern_patches(void)
 {
+#if !defined(DRSETUP_INSTALL_ONLY) || defined(DRSETUP_REGION_TEST)
+    /* let MCP's config client write the read-only sys_prod nodes */
+    ASM_T_PATCH_K(ADDR_CNFG_LEAF_ACCESS, "nop\nnop\n");
+    ASM_T_PATCH_K(ADDR_CNFG_ITEM_ACCESS, "nop\n");
+#endif
     trampoline_t_blreplace(ADDR_LOAD_SYSPROD_CALL, drsetup_loadsysprod);
 }
 

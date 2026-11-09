@@ -382,9 +382,12 @@ Hardware, 2026-11-08:
 
 Boot Recovery has no region step: `MCP_DR_SystemUpdateFromMedia` only reads
 `sys_prod.xml` (and on ATFS media picks `update.inf.<REG>` from `product_area`).
-The native writer, `/dev/mcp` ioctlv 0x41 `SetSysProdSettings`, is behind
-`IOS_CheckDebugMode()` (`0x05024648`, OTP), closed on retail even in recovery;
-`wafel_setup_mlc` NOPs it plus two XML access checks.
+The native writer, `/dev/mcp` ioctlv 0x41 `SetSysProdSettings` (what
+`wafel_setup_mlc` uses, with its `IOS_CheckDebugMode()` check at `0x05024648`
+and two XML access checks NOPed), isn't reachable in recovery: there `/dev/mcp`
+is the recovery thread's resource manager (`MCP_DRThreadEntry`), which only
+knows ioctl 0x7e and answers everything else with -4. `/dev/usr_cfg` isn't
+running either. So the plugin calls what 0x41 calls: MCP's config client.
 
 The plugin uses the same rule as `wafel_setup_mlc`'s `fix_region`, at the point
 the user suggested: the end of the recovery update.
@@ -399,23 +402,31 @@ the user suggested: the end of the recovery update.
   It runs in the install thread (that thread calls the DR function).
 - It reads the coldboot title with `MCP_SysCfg_GetDefaultTitle`
   (`0x05004714`, Thumb). If it is `00050010100400x0`, the region is `1 << x`
-  (1 JPN, 2 USA, 4 EUR, ...). If `product_area` or `game_region` differ, it
-  rewrites `/vol/system_slc/config/sys_prod.xml` with both values replaced
-  (decimal text, other fields untouched), flushes the SLC, then calls the
-  original `MCP_LoadSysProdXML`, which loads the fixed file.
-- The write is **in place** (`r+`, same length, the file is never truncated),
-  so a failed write or power loss can't leave `sys_prod.xml` empty. The FSA
-  client has no rename, so there is no temp-file swap. A region with a different
-  digit count than the old one (16/32/64 for CHN/KOR/TWN vs. 1/2/4/8) is
-  refused with a message, sys_prod stays unchanged.
+  (1 JPN, 2 USA, 4 EUR, ...). It reads `slc:sys_prod.product_area` and
+  `.game_region` with `MCP_Cnfg_Read` (`0x0503b43c`) and, if they differ,
+  writes both with `MCP_Cnfg_Write` (`0x0503b400`), caller permissions 0x777
+  as MCP uses, item access 0, type u32, size 4 (must match the node's
+  `length`). Then the original `MCP_LoadSysProdXML` loads the file.
+- `MCP_Cnfg_Write` reads the file, merges the items into its tree
+  (`Cnfg_MergeTree` `0x0503c970`) and saves the whole tree, so the other fields
+  are kept (hardware: serial and version unchanged after the writes). The
+  sys_prod nodes are read-only for every caller, so the plugin applies
+  `wafel_setup_mlc`'s two patches: `0x0503cc44` (node not writable → error)
+  and `0x0503cd32` (item access ≠ node access; irrelevant with access 0). Not
+  applied in the install-only build. They only exist during the recovery boot.
+- Replaced the earlier hand-written in-place XML edit (same digit count only,
+  so CHN/KOR/TWN couldn't be set) on 2026-11-09.
 - `wafel_setup_mlc`'s title check
   `coldbootTitle & 0xFFFFFFFFFFFFF0FF != 0005001010040000UL` never fails
   (`!=` binds tighter than `&`); the plugin's version uses parentheses.
 - sys_prod.xml on the test console: 860 bytes, `product_area 4`,
   `game_region 4`, `ntsc_pal PAL`, `5ghz_country_code EU`, model `WUP-101(03)`.
-- Hardware, 2026-11-08 (`REGIONTEST=1`): region set to 2 before the install, hook
-  read coldboot title `0005001010040200`, rewrote sys_prod to 4 (860 bytes),
-  install reported success, plugin deleted itself.
+- Hardware, 2026-11-08 (`REGIONTEST=1`, old XML edit): region set to 2 before
+  the install, hook rewrote sys_prod to 4, success.
+- Hardware, 2026-11-09 (`REGIONTEST=1`, config client, redNAND): read 4/4 →
+  wrote 2 (result 0), re-read 2/2, version 5, serial unchanged; after the
+  install read 2/2 → wrote 4, re-read 4/4, serial unchanged,
+  `MCP_LoadSysProdXML` 0, success, plugin removed.
 
 ## Format prompts (EJECT to confirm)
 
