@@ -417,14 +417,26 @@ the user suggested: the end of the recovery update.
   read coldboot title `0005001010040200`, rewrote sys_prod to 4 (860 bytes),
   install reported success, plugin deleted itself.
 
-## Format prompts (EJECT to confirm) — in progress
+## Format prompts (EJECT to confirm)
 
-Goal: before recovery formats SLCCMPT or the MLC, ask on the TV: "Press EJECT
-to continue. Hold POWER to cancel and power off." No timeout (without the
-format the install can't run anyway). `source/prompt.c`,
-`display_show_early()` in `source/display.c`. Test build: `make PROMPTTEST=1`
-(asks once before the resume-time MLC format call `0x0510f5b8`, then calls the
-format unchanged; combine with `NOINSTALL=1`).
+Full build only (the install-only build blocks all formats). Every format
+call that isn't blocked (resume MLC `0x0510f5b8`, resume SLCCMPT
+`0x0510f5ce`, the DR update's MLC/SLCCMPT calls, and SLC with `SLCFORMAT=1`)
+goes through `drsetup_confirm_format` (`source/main.c`). It repeats
+`MCP_FormatDevice`'s own decision (`MCP_fsaGetVolumeInfo` with MCP's FSA
+handle `0x05070184`, file system name at `+0x24`, 8-char compare, or
+`force`). Only if MCP would really format does it show, without timeout:
+
+```
+No valid wfs file system detected on /dev/mlc01.
+Format it? Everything on it will be erased.
+Press EJECT to continue. Hold POWER to cancel and power off.
+```
+
+The text doesn't print the file system that was found: an unreadable volume
+(also a WFS with another console's key) is always attached as `raw`.
+Prompt code: `source/prompt.c`, early screen: `display_show_early()` in
+`source/display.c`.
 
 Hardware findings (2026-11-09, redNAND entry 2):
 
@@ -446,6 +458,12 @@ Hardware findings (2026-11-09, redNAND entry 2):
   returns -31 with "MCP: Power transitions are explicitly disabled." during
   resume. So cancelling = holding POWER (SMC hard power-off). A short POWER
   press is swallowed (MCP would restart into recovery and ask again).
+- Formatted redNAND MLC and SLCCMPT: no prompt, recovery as before.
+- Blanked redNAND MLC and SLCCMPT (both attached as `raw`): MLC prompt, a
+  short POWER press was ignored (events 0x40), EJECT -> "Formatting Device
+  mlc to wfs"; then the SLCCMPT prompt, EJECT -> "isfs(compat)"; then the full
+  reinstall from `wafel_install` succeeded (region already matching, plugin
+  removed).
 
 ## What happens on errors
 
