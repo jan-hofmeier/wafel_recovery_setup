@@ -58,20 +58,39 @@ static void drsetup_initmenu(s32 w, s32 h, s32 pitch, s32 format,
     org(w, h, pitch, format, pixels);
 }
 
-/* replaces the recovery thread's "bl MCP_ShowMenu" */
-static int drsetup_showmenu(int r0, int r1, int r2, int r3, int (*org)(void))
+/* wafel_screen_log (if loaded) draws into the same buffer: from now on only
+ * its bottom box, so it doesn't paint over the recovery menu or re-initialise
+ * the TV after DC_INIT. Wait two of its 50 ms frames so a full redraw already
+ * running has finished. */
+static void scrlog_to_bottom(void)
 {
-    (void)r0; (void)r1; (void)r2; (void)r3;
-    /* wafel_screen_log (if loaded) draws into the same buffer: from now on
-     * only its bottom box, so it doesn't paint over the recovery menu or
-     * re-initialise the TV after DC_INIT. Wait two of its 50 ms frames so a
-     * full redraw already running has finished. */
     volatile int *scrlog_bottom = (volatile int *)wafel_find_symbol("scrlog_bottom_only");
-    if (scrlog_bottom) {
+    if (scrlog_bottom && !*scrlog_bottom) {
         *scrlog_bottom = 1;
         msleep(100);
         debug_printf("drsetup: screen log switched to the bottom box\n");
     }
+}
+
+#define MCP_ShowMenu ((int (*)(void))(0x051003a8 | 1))
+
+/* bring the recovery screen up before the recovery thread does (for prompts
+ * during recovery resume); the regular MCP_ShowMenu later just redraws it */
+void display_show_early(void)
+{
+    if (MCP_MENU[0x50 / 4])
+        return;                         /* already set up by MCP_InitMenu */
+    scrlog_to_bottom();
+    MCP_ShowMenu();
+    debug_printf("drsetup: early menu %ux%u fb %08X\n",
+                 MCP_MENU[0x28 / 4], MCP_MENU[0x2c / 4], MCP_MENU[0x50 / 4]);
+}
+
+/* replaces the recovery thread's "bl MCP_ShowMenu" */
+static int drsetup_showmenu(int r0, int r1, int r2, int r3, int (*org)(void))
+{
+    (void)r0; (void)r1; (void)r2; (void)r3;
+    scrlog_to_bottom();
     int ret = org();
     debug_printf("drsetup: menu %ux%u fb %08X\n",
                  MCP_MENU[0x28 / 4], MCP_MENU[0x2c / 4], MCP_MENU[0x50 / 4]);

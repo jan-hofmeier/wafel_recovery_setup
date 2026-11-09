@@ -23,6 +23,15 @@
 /* writes MCP's default system.xml (stock: only after a full SLC wipe) */
 #define MCP_WriteDefaultSystemConfig \
     ((void (*)(u32 overwrite))(0x050049c0 | 1))
+/* MCP_fsaGetVolumeInfo(handle, device, info): FSA volume info of a device
+ * (thunk); MCP_FSA_HANDLE is MCP's own /dev/fsa handle. FSAVolumeInfo is
+ * 0x1bc bytes, file system name (8 chars) at +0x24 (see MCP_FormatDevice
+ * 0x050160d8, which compares it with the requested one unless force). */
+#define MCP_fsaGetVolumeInfo \
+    ((int (*)(int handle, const char *device, void *info))(0x05059170 | 1))
+#define MCP_FSA_HANDLE      (*(volatile int *)0x05070184)
+#define FSA_VOLINFO_SIZE    0x1bc
+#define FSA_VOLINFO_FS      0x24
 /* ES: merge a cert chain into /sys/cert.sys (ARM) */
 #define esMergeCertSys \
     ((int (*)(const void *certs, u32 size))0x05050448)

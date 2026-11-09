@@ -417,6 +417,36 @@ the user suggested: the end of the recovery update.
   read coldboot title `0005001010040200`, rewrote sys_prod to 4 (860 bytes),
   install reported success, plugin deleted itself.
 
+## Format prompts (EJECT to confirm) — in progress
+
+Goal: before recovery formats SLCCMPT or the MLC, ask on the TV: "Press EJECT
+to continue. Hold POWER to cancel and power off." No timeout (without the
+format the install can't run anyway). `source/prompt.c`,
+`display_show_early()` in `source/display.c`. Test build: `make PROMPTTEST=1`
+(asks once before the resume-time MLC format call `0x0510f5b8`, then calls the
+format unchanged; combine with `NOINSTALL=1`).
+
+Hardware findings (2026-11-09, redNAND entry 2):
+
+- The resume-time format calls run in PM resume, before the recovery thread
+  draws its menu, so the prompt brings the menu up early (`MCP_ShowMenu`
+  called directly). The recovery thread's own `MCP_ShowMenu` later just
+  redraws it; no problem.
+- Buttons come from SMC register 0x41 (BSP `SMC` `SystemEventFlag`, read
+  clears it; 0x20 EJECT, 0x40 POWER). MCP reads it in
+  `MCP_HandleWakeEvents` (0x05028508), but that handler doesn't run during PM
+  resume: an EJECT pressed at the prompt was only read (and logged "MCP:
+  Eject button pressed") at 36 s, after resume. A hook on its read alone saw
+  nothing. Fix: the prompt polls the register itself every 100 ms through
+  MCP's `MCP_bspRead` (0x05059568), after one read that drops presses latched
+  before the prompt. The hook on MCP's read (`0x05028556`) stays for prompts
+  after resume; while a prompt is open it hands EJECT/POWER to the prompt and
+  hides them from MCP.
+- A clean power-off from the prompt doesn't work: `MCP_RequestOff(0,0)`
+  returns -31 with "MCP: Power transitions are explicitly disabled." during
+  resume. So cancelling = holding POWER (SMC hard power-off). A short POWER
+  press is swallowed (MCP would restart into recovery and ask again).
+
 ## What happens on errors
 
 Every plugin message goes to `/vol/sdcard/wafel_drsetup.log` **and** the

@@ -25,6 +25,8 @@
 #include "config.h"
 #include "display.h"
 #include "slc.h"
+#include "mcp.h"
+#include "prompt.h"
 
 #define ADDR_KERN_PANIC         0x08129ce0  /* kernel panic -> bx lr */
 #define ADDR_STARTUP_DBGCHK     0x0501fc98  /* MCP_Startup: bl IOS_CheckDebugMode */
@@ -48,6 +50,8 @@
  *    by SCFM at boot; SLCFORMAT is for setups without SCFM (redNAND).
  *  - MLC and SLCCMPT: blocked in the install-only build; the full build lets
  *    them format when they have no valid file system.
+ * The calls that aren't blocked go through drsetup_confirm_format: if MCP is
+ * really about to format, the user has to confirm with EJECT first.
  */
 static const struct { uintptr_t addr; int slc; } format_calls[] = {
     { 0x0510f59e, 1 },      /* resume: /dev/slc01 */
@@ -66,6 +70,52 @@ static int drsetup_no_format(const char *dev, const char *fs, int force, int r3,
     return 0;
 }
 
+/* MCP_FormatDevice's own decision: it formats if forced or if the attached
+ * volume's file system isn't the requested one; if it can't get the volume
+ * info it returns that error without formatting */
+static int format_needed(const char *dev, const char *fs, int force, char *found)
+{
+    u32 info[(FSA_VOLINFO_SIZE + 3) / 4];
+    int r = MCP_fsaGetVolumeInfo(MCP_FSA_HANDLE, dev, info);
+    if (r != 0) {
+        debug_printf("drsetup: %s volume info error %d, no format\n", dev, r);
+        return 0;
+    }
+    const char *vfs = (const char *)info + FSA_VOLINFO_FS;
+    int same = 1;                       /* strncmp(vfs, fs, 8) == 0 */
+    for (int i = 0; i < 8; i++) {
+        if (vfs[i] != fs[i]) { same = 0; break; }
+        if (!fs[i]) break;
+    }
+    for (int i = 0; i < 8; i++) {       /* printable copy for the message */
+        char c = vfs[i];
+        if (!c) break;
+        found[i] = (c < 0x20 || c > 0x7e) ? '?' : c;
+    }
+    found[8] = 0;
+    return force || !same;
+}
+
+static int drsetup_confirm_format(const char *dev, const char *fs, int force, int r3,
+                                  int (*org)(const char *, const char *, int))
+{
+    (void)r3;
+    char found[9] = {0};
+    if (format_needed(dev, fs, force, found)) {
+        debug_printf("drsetup: %s would be formatted to %s (now '%s', force %d)\n",
+                     dev, fs, found, force);
+        display_show_early();
+        /* no "found" on screen: an unreadable volume (e.g. WFS with another
+         * console's key) is always attached as "raw" */
+        if (force)
+            DrCon_Printf("\n%s is set to be reformatted to %s.\n", dev, fs);
+        else
+            DrCon_Printf("\nNo valid %s file system detected on %s.\n", fs, dev);
+        drsetup_confirm("Format it? Everything on it will be erased.");
+    }
+    return org(dev, fs, force);
+}
+
 static void patch_formats(void)
 {
     for (unsigned i = 0; i < sizeof(format_calls) / sizeof(format_calls[0]); i++) {
@@ -77,8 +127,8 @@ static void patch_formats(void)
         if (format_calls[i].slc)
             block = 0;
 #endif
-        if (block)
-            trampoline_t_blreplace(format_calls[i].addr, drsetup_no_format);
+        trampoline_t_blreplace(format_calls[i].addr,
+                               block ? drsetup_no_format : drsetup_confirm_format);
     }
 
 #if !defined(DRSETUP_INSTALL_ONLY) && !defined(DRSETUP_FORCE_FORMAT)
@@ -124,6 +174,7 @@ void kern_main(void)
     ASM_T_PATCH_K(ADDR_TICKET_SKIP, ".short 0xe0ba\n");
 
     patch_formats();
+    prompt_kern_patches();
     slc_kern_patches();
     display_kern_patches();
 }
