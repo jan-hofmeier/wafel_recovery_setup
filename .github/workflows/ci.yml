@@ -1,0 +1,74 @@
+name: CI-Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build-binary:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Checkout stroopwafel (wafel_core headers)
+      uses: actions/checkout@v4
+      with:
+        repository: StroopwafelCFW/stroopwafel
+        path: stroopwafel
+
+    - name: Build Docker image
+      run: docker build . -t builder:latest
+
+    - name: build 5drsetup (full)
+      run: |
+        docker run --rm -v ${PWD}:/project builder:latest /bin/bash -c "export STROOPWAFEL_ROOT=/project/stroopwafel && make BUILD=build_setup"
+
+    - name: build 5drinst (install only)
+      run: |
+        docker run --rm -v ${PWD}:/project builder:latest /bin/bash -c "export STROOPWAFEL_ROOT=/project/stroopwafel && make BUILD=build_inst INSTALLONLY=1"
+
+    - uses: actions/upload-artifact@v4
+      with:
+       name: wafel_recovery_setup-artifacts
+       path: |
+         5drsetup.ipx
+         5drinst.ipx
+
+  deploy-binary:
+    needs: build-binary
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Get environment variables
+      id: get_vars
+      run: |
+        echo "REPOSITORY_NAME=$(echo "$GITHUB_REPOSITORY" | awk -F / '{print $2}')" >> $GITHUB_ENV
+        echo "DATETIME=$(date '+%Y%m%d-%H%M%S')" >> $GITHUB_ENV
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: wafel_recovery_setup-artifacts
+        path: artifacts
+
+    - name: Create Release
+      uses: "softprops/action-gh-release@v2"
+      with:
+        tag_name: ${{ env.REPOSITORY_NAME }}-${{ env.DATETIME }}
+        draft: true
+        prerelease: true
+        generate_release_notes: true
+        name: Nightly-${{ env.REPOSITORY_NAME }}-${{ env.DATETIME }}
+        files: |
+          artifacts/5drsetup.ipx
+          artifacts/5drinst.ipx
